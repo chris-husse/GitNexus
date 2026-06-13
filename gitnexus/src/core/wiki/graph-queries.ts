@@ -5,7 +5,13 @@
  * Uses the MCP-style pooled lbug-adapter for connection management.
  */
 
-import { initLbug, executeQuery, closeLbug, touchRepo } from '../lbug/pool-adapter.js';
+import {
+  initLbug,
+  executeQuery,
+  executeParameterized,
+  closeLbug,
+  touchRepo,
+} from '../lbug/pool-adapter.js';
 
 const REPO_ID = '__wiki__';
 
@@ -137,15 +143,18 @@ export async function getInterFileCallEdges(): Promise<CallEdge[]> {
 export async function getIntraModuleCallEdges(filePaths: string[]): Promise<CallEdge[]> {
   if (filePaths.length === 0) return [];
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
-  const rows = await executeQuery(
+  // Bind file paths as a prepared-statement array param ($files) instead of
+  // interpolating them into the Cypher — closes the Cypher-injection vector for
+  // attacker-controlled file paths (B1).
+  const rows = await executeParameterized(
     REPO_ID,
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
-    WHERE a.filePath IN [${fileList}] AND b.filePath IN [${fileList}]
+    WHERE a.filePath IN $files AND b.filePath IN $files
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
   `,
+    { files: filePaths },
   );
 
   return rows.map((r) => ({
@@ -165,28 +174,29 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
 }> {
   if (filePaths.length === 0) return { outgoing: [], incoming: [] };
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
-
-  const outRows = await executeQuery(
+  // Bind file paths as a prepared-statement array param ($files) (B1).
+  const outRows = await executeParameterized(
     REPO_ID,
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
-    WHERE a.filePath IN [${fileList}] AND NOT b.filePath IN [${fileList}]
+    WHERE a.filePath IN $files AND NOT b.filePath IN $files
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
     LIMIT 30
   `,
+    { files: filePaths },
   );
 
-  const inRows = await executeQuery(
+  const inRows = await executeParameterized(
     REPO_ID,
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
-    WHERE NOT a.filePath IN [${fileList}] AND b.filePath IN [${fileList}]
+    WHERE NOT a.filePath IN $files AND b.filePath IN $files
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
     LIMIT 30
   `,
+    { files: filePaths },
   );
 
   return {
@@ -212,19 +222,20 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
 export async function getProcessesForFiles(filePaths: string[], limit = 5): Promise<ProcessInfo[]> {
   if (filePaths.length === 0) return [];
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
-
-  // Find processes that have steps in the given files
-  const procRows = await executeQuery(
+  // Find processes that have steps in the given files. File paths are bound as a
+  // prepared-statement array param ($files); `limit` is an internal numeric
+  // default, not user input, so it stays inline (B1).
+  const procRows = await executeParameterized(
     REPO_ID,
     `
     MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-    WHERE s.filePath IN [${fileList}]
+    WHERE s.filePath IN $files
     RETURN DISTINCT p.id AS id, p.heuristicLabel AS label,
            p.processType AS type, p.stepCount AS stepCount
     ORDER BY stepCount DESC
     LIMIT ${limit}
   `,
+    { files: filePaths },
   );
 
   const processes: ProcessInfo[] = [];
@@ -234,14 +245,16 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
     const type = row.type || row[2] || 'unknown';
     const stepCount = row.stepCount || row[3] || 0;
 
-    // Get the full step trace for this process
-    const stepRows = await executeQuery(
+    // Get the full step trace for this process — bind the process id as a param
+    // ($procId) instead of interpolating it into the Cypher (B1).
+    const stepRows = await executeParameterized(
       REPO_ID,
       `
-      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${procId.replace(/'/g, "''")}'})
+      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $procId})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,
+      { procId },
     );
 
     processes.push({
@@ -283,13 +296,15 @@ export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
     const type = row.type || row[2] || 'unknown';
     const stepCount = row.stepCount || row[3] || 0;
 
-    const stepRows = await executeQuery(
+    // Bind the process id as a param ($procId) instead of interpolating it (B1).
+    const stepRows = await executeParameterized(
       REPO_ID,
       `
-      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${procId.replace(/'/g, "''")}'})
+      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $procId})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,
+      { procId },
     );
 
     processes.push({

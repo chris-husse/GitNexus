@@ -1,5 +1,21 @@
-import { afterAll, beforeAll, describe, it, expect } from 'vitest';
-import {
+import { afterAll, afterEach, beforeAll, describe, it, expect, vi } from 'vitest';
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+
+// Mock the DNS resolver used by validateGitUrl's rebinding defense (D1). The
+// default resolves every host to a public IP so the existing hostname-based
+// "valid URL" cases stay hermetic (no real network); individual rebinding tests
+// override it via mockResolvedValueOnce / mockResolvedValue.
+const dnsLookupMock = vi.fn(async () => [{ address: '140.82.121.4', family: 4 }]);
+// git-clone.ts imports `dns from 'dns/promises'`; mock that exact specifier.
+vi.mock('dns/promises', () => ({
+  default: { lookup: (...args: unknown[]) => (dnsLookupMock as any)(...args) },
+  lookup: (...args: unknown[]) => (dnsLookupMock as any)(...args),
+}));
+
+const {
   extractRepoName,
   getCloneDir,
   validateGitUrl,
@@ -7,12 +23,8 @@ import {
   buildCloneArgs,
   normalizeGitUrlForCompare,
   assertRemoteMatchesRequestedUrl,
-} from '../../src/server/git-clone.js';
-import path from 'node:path';
-import os from 'node:os';
-import fs from 'node:fs/promises';
-import { spawn } from 'node:child_process';
-import { getRemoteOriginUrl } from '../../src/storage/git.js';
+} = await import('../../src/server/git-clone.js');
+const { getRemoteOriginUrl } = await import('../../src/storage/git.js');
 
 describe('git-clone', () => {
   describe('extractRepoName', () => {
@@ -123,157 +135,283 @@ describe('git-clone', () => {
   });
 
   describe('validateGitUrl', () => {
-    it('allows valid HTTPS GitHub URLs', () => {
-      expect(() => validateGitUrl('https://github.com/user/repo.git')).not.toThrow();
-      expect(() => validateGitUrl('https://github.com/user/repo')).not.toThrow();
+    it('allows valid HTTPS GitHub URLs', async () => {
+      await expect(validateGitUrl('https://github.com/user/repo.git')).resolves.toBeUndefined();
+      await expect(validateGitUrl('https://github.com/user/repo')).resolves.toBeUndefined();
     });
 
-    it('allows valid HTTP URLs', () => {
-      expect(() => validateGitUrl('http://gitlab.com/user/repo.git')).not.toThrow();
+    it('allows valid HTTP URLs', async () => {
+      await expect(validateGitUrl('http://gitlab.com/user/repo.git')).resolves.toBeUndefined();
     });
 
-    it('blocks SSH protocol', () => {
-      expect(() => validateGitUrl('ssh://git@github.com/user/repo.git')).toThrow(
+    it('blocks SSH protocol', async () => {
+      await expect(validateGitUrl('ssh://git@github.com/user/repo.git')).rejects.toThrow(
         'Only https:// and http://',
       );
     });
 
-    it('blocks file:// protocol', () => {
-      expect(() => validateGitUrl('file:///etc/passwd')).toThrow('Only https:// and http://');
+    it('blocks file:// protocol', async () => {
+      await expect(validateGitUrl('file:///etc/passwd')).rejects.toThrow(
+        'Only https:// and http://',
+      );
     });
 
-    it('blocks IPv4 loopback', () => {
-      expect(() => validateGitUrl('http://127.0.0.1/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://127.255.0.1/repo.git')).toThrow('private/internal');
+    it('blocks IPv4 loopback', async () => {
+      await expect(validateGitUrl('http://127.0.0.1/repo.git')).rejects.toThrow('private/internal');
+      await expect(validateGitUrl('http://127.255.0.1/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks IPv6 loopback ::1', () => {
+    it('blocks IPv6 loopback ::1', async () => {
       // Node URL parser strips brackets: hostname is "::1" not "[::1]"
-      expect(() => validateGitUrl('http://[::1]/repo.git')).toThrow('private/internal');
+      await expect(validateGitUrl('http://[::1]/repo.git')).rejects.toThrow('private/internal');
     });
 
-    it('blocks IPv4 private ranges (10.x, 172.16-31.x, 192.168.x)', () => {
-      expect(() => validateGitUrl('http://10.0.0.1/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://172.16.0.1/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://172.31.255.255/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://192.168.1.1/repo.git')).toThrow('private/internal');
-    });
-
-    it('blocks link-local addresses', () => {
-      expect(() => validateGitUrl('http://169.254.1.1/repo.git')).toThrow('private/internal');
-    });
-
-    it('blocks cloud metadata hostname', () => {
-      expect(() => validateGitUrl('http://metadata.google.internal/repo')).toThrow(
+    it('blocks IPv4 private ranges (10.x, 172.16-31.x, 192.168.x)', async () => {
+      await expect(validateGitUrl('http://10.0.0.1/repo.git')).rejects.toThrow('private/internal');
+      await expect(validateGitUrl('http://172.16.0.1/repo.git')).rejects.toThrow(
         'private/internal',
       );
-      expect(() => validateGitUrl('http://metadata.azure.com/repo')).toThrow('private/internal');
-    });
-
-    it('blocks IPv6 ULA (fc/fd)', () => {
-      expect(() => validateGitUrl('http://[fc00::1]/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://[fd12::1]/repo.git')).toThrow('private/internal');
-    });
-
-    it('blocks IPv6 link-local (fe80)', () => {
-      expect(() => validateGitUrl('http://[fe80::1]/repo.git')).toThrow('private/internal');
-    });
-
-    it('blocks IPv4-mapped IPv6', () => {
-      expect(() => validateGitUrl('http://[::ffff:127.0.0.1]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://172.31.255.255/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://192.168.1.1/repo.git')).rejects.toThrow(
         'private/internal',
       );
     });
 
-    it('blocks IPv4-compatible IPv6 (RFC 4291 deprecated, ::w.x.y.z)', () => {
+    it('blocks link-local addresses', async () => {
+      await expect(validateGitUrl('http://169.254.1.1/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+    });
+
+    it('blocks cloud metadata hostname', async () => {
+      await expect(validateGitUrl('http://metadata.google.internal/repo')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://metadata.azure.com/repo')).rejects.toThrow(
+        'private/internal',
+      );
+    });
+
+    it('blocks IPv6 ULA (fc/fd)', async () => {
+      await expect(validateGitUrl('http://[fc00::1]/repo.git')).rejects.toThrow('private/internal');
+      await expect(validateGitUrl('http://[fd12::1]/repo.git')).rejects.toThrow('private/internal');
+    });
+
+    it('blocks IPv6 link-local (fe80)', async () => {
+      await expect(validateGitUrl('http://[fe80::1]/repo.git')).rejects.toThrow('private/internal');
+    });
+
+    it('blocks IPv4-mapped IPv6', async () => {
+      await expect(validateGitUrl('http://[::ffff:127.0.0.1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+    });
+
+    it('blocks IPv4-compatible IPv6 (RFC 4291 deprecated, ::w.x.y.z)', async () => {
       // Node's URL parser collapses ::127.0.0.1 to ::7f00:1 — no ::ffff: marker,
       // but still routable to 127.0.0.1 on most stacks.
-      expect(() => validateGitUrl('http://[::127.0.0.1]/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://[::7f00:1]/repo.git')).toThrow('private/internal');
+      await expect(validateGitUrl('http://[::127.0.0.1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://[::7f00:1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
       // 169.254.169.254 (cloud metadata) embedded as IPv4-compatible
-      expect(() => validateGitUrl('http://[::a9fe:a9fe]/repo.git')).toThrow('private/internal');
+      await expect(validateGitUrl('http://[::a9fe:a9fe]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks IPv4-compatible IPv6 in expanded / zero-padded forms', () => {
+    it('blocks IPv4-compatible IPv6 in expanded / zero-padded forms', async () => {
       // The compressed-form check above relies on the WHATWG URL parser
       // normalising fully-expanded inputs to ::xxxx[:yyyy]. These cases pin
       // that assumption: if a future Node release stops collapsing them, a
       // bypass would silently re-open without these tests catching it.
-      expect(() => validateGitUrl('http://[0:0:0:0:0:0:7f00:1]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[0:0:0:0:0:0:7f00:1]/repo.git')).rejects.toThrow(
         'private/internal',
       );
       expect(() =>
         validateGitUrl('http://[0000:0000:0000:0000:0000:0000:7f00:0001]/repo.git'),
-      ).toThrow('private/internal');
+      ).rejects.toThrow('private/internal');
       // Mixed notation: trailing IPv4 quad in an otherwise expanded address.
-      expect(() => validateGitUrl('http://[0:0:0:0:0:0:127.0.0.1]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[0:0:0:0:0:0:127.0.0.1]/repo.git')).rejects.toThrow(
         'private/internal',
       );
     });
 
-    it('blocks NAT64 well-known prefix (64:ff9b::/96)', () => {
+    it('blocks NAT64 well-known prefix (64:ff9b::/96)', async () => {
       // 64:ff9b::7f00:1 → 127.0.0.1 via NAT64 translation
-      expect(() => validateGitUrl('http://[64:ff9b::7f00:1]/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://[64:ff9b::a9fe:a9fe]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[64:ff9b::7f00:1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://[64:ff9b::a9fe:a9fe]/repo.git')).rejects.toThrow(
         'private/internal',
       );
       // RFC 8215 local NAT64 prefix
-      expect(() => validateGitUrl('http://[64:ff9b:1::1]/repo.git')).toThrow('private/internal');
+      await expect(validateGitUrl('http://[64:ff9b:1::1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks NAT64 with embedded RFC1918 addresses', () => {
+    it('blocks NAT64 with embedded RFC1918 addresses', async () => {
       // The startsWith('64:ff9b:') check covers any embedded IPv4. These
       // explicit RFC1918 architectures document SSRF coverage for the full private
       // IPv4 surface — not just loopback and cloud metadata.
-      expect(() => validateGitUrl('http://[64:ff9b::a00:1]/repo.git')).toThrow('private/internal'); // 10.0.0.1
-      expect(() => validateGitUrl('http://[64:ff9b::ac10:1]/repo.git')).toThrow('private/internal'); // 172.16.0.1
-      expect(() => validateGitUrl('http://[64:ff9b::c0a8:101]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[64:ff9b::a00:1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      ); // 10.0.0.1
+      await expect(validateGitUrl('http://[64:ff9b::ac10:1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      ); // 172.16.0.1
+      await expect(validateGitUrl('http://[64:ff9b::c0a8:101]/repo.git')).rejects.toThrow(
         'private/internal',
       ); // 192.168.1.1
     });
 
-    it('blocks 6to4 prefix (2002::/16, RFC 3056)', () => {
+    it('blocks 6to4 prefix (2002::/16, RFC 3056)', async () => {
       // 6to4 encodes an IPv4 address in bits 17-48, so 2002:WWXX:YYZZ::*
       // routes to W.X.Y.Z on 6to4-capable stacks. The protocol is deprecated
       // (RFC 7526), so the entire 2002::/16 block is defensively rejected.
-      expect(() => validateGitUrl('http://[2002:7f00:1::1]/repo.git')).toThrow('private/internal'); // 127.0.0.1
-      expect(() => validateGitUrl('http://[2002:a9fe:a9fe::1]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[2002:7f00:1::1]/repo.git')).rejects.toThrow(
+        'private/internal',
+      ); // 127.0.0.1
+      await expect(validateGitUrl('http://[2002:a9fe:a9fe::1]/repo.git')).rejects.toThrow(
         'private/internal',
       ); // 169.254.169.254
-      expect(() => validateGitUrl('http://[2002:c0a8:101::1]/repo.git')).toThrow(
+      await expect(validateGitUrl('http://[2002:c0a8:101::1]/repo.git')).rejects.toThrow(
         'private/internal',
       ); // 192.168.1.1
     });
 
-    it('does not block valid public IPs (IPv4 and IPv6)', () => {
-      expect(() => validateGitUrl('https://140.82.121.4/repo.git')).not.toThrow();
+    it('does not block valid public IPs (IPv4 and IPv6)', async () => {
+      await expect(validateGitUrl('https://140.82.121.4/repo.git')).resolves.toBeUndefined();
       // Regression guard against over-blocking legitimate public IPv6.
       // Cloudflare DNS (2606:4700::/32) and Google DNS (2001:4860::/32) —
       // chosen because their prefixes don't collide with any block above.
-      expect(() => validateGitUrl('https://[2606:4700:4700::1111]/repo.git')).not.toThrow();
-      expect(() => validateGitUrl('https://[2001:4860:4860::8888]/repo.git')).not.toThrow();
+      await expect(
+        validateGitUrl('https://[2606:4700:4700::1111]/repo.git'),
+      ).resolves.toBeUndefined();
+      await expect(
+        validateGitUrl('https://[2001:4860:4860::8888]/repo.git'),
+      ).resolves.toBeUndefined();
     });
 
-    it('blocks CGN range (100.64.0.0/10)', () => {
-      expect(() => validateGitUrl('http://100.64.0.1/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://100.127.255.255/repo.git')).toThrow('private/internal');
+    it('blocks CGN range (100.64.0.0/10)', async () => {
+      await expect(validateGitUrl('http://100.64.0.1/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://100.127.255.255/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks benchmarking range (198.18.0.0/15)', () => {
-      expect(() => validateGitUrl('http://198.18.0.1/repo.git')).toThrow('private/internal');
-      expect(() => validateGitUrl('http://198.19.255.255/repo.git')).toThrow('private/internal');
+    it('blocks benchmarking range (198.18.0.0/15)', async () => {
+      await expect(validateGitUrl('http://198.18.0.1/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      await expect(validateGitUrl('http://198.19.255.255/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks numeric decimal IP encoding', () => {
-      expect(() => validateGitUrl('http://2130706433/repo.git')).toThrow('private/internal');
+    it('blocks numeric decimal IP encoding', async () => {
+      await expect(validateGitUrl('http://2130706433/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks hex IP encoding', () => {
-      expect(() => validateGitUrl('http://0x7f000001/repo.git')).toThrow('private/internal');
+    it('blocks hex IP encoding', async () => {
+      await expect(validateGitUrl('http://0x7f000001/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
     });
 
-    it('blocks 0.0.0.0', () => {
-      expect(() => validateGitUrl('http://0.0.0.0/repo.git')).toThrow('private/internal');
+    it('blocks 0.0.0.0', async () => {
+      await expect(validateGitUrl('http://0.0.0.0/repo.git')).rejects.toThrow('private/internal');
+    });
+
+    // ── DNS-rebinding defense (D1) ──────────────────────────────────────
+    describe('DNS rebinding (resolved-address checks)', () => {
+      afterEach(() => {
+        // Restore the default public-IP resolver for the next test.
+        dnsLookupMock.mockReset();
+        dnsLookupMock.mockResolvedValue([{ address: '140.82.121.4', family: 4 }]);
+      });
+
+      it('rejects a public-looking hostname that resolves to a private IPv4', async () => {
+        dnsLookupMock.mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }]);
+        await expect(validateGitUrl('https://rebind.attacker.example/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+      });
+
+      it('rejects a hostname that resolves to loopback (127.0.0.1)', async () => {
+        dnsLookupMock.mockResolvedValueOnce([{ address: '127.0.0.1', family: 4 }]);
+        await expect(validateGitUrl('https://localhost-alias.example/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+      });
+
+      it('rejects a hostname that resolves to the cloud metadata IP (169.254.169.254)', async () => {
+        dnsLookupMock.mockResolvedValueOnce([{ address: '169.254.169.254', family: 4 }]);
+        await expect(validateGitUrl('https://metadata-alias.example/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+      });
+
+      it('rejects a hostname that resolves to a private IPv6 (ULA)', async () => {
+        dnsLookupMock.mockResolvedValueOnce([{ address: 'fd00::1', family: 6 }]);
+        await expect(validateGitUrl('https://v6-rebind.example/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+      });
+
+      it('rejects when ANY of multiple resolved addresses is private', async () => {
+        // A public A record plus a private one — git could connect to either, so
+        // the presence of a single private address must reject the whole URL.
+        dnsLookupMock.mockResolvedValueOnce([
+          { address: '140.82.121.4', family: 4 },
+          { address: '192.168.1.10', family: 4 },
+        ]);
+        await expect(validateGitUrl('https://mixed.attacker.example/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+      });
+
+      it('passes a hostname that resolves only to public addresses', async () => {
+        dnsLookupMock.mockResolvedValueOnce([
+          { address: '140.82.121.4', family: 4 },
+          { address: '2606:4700:4700::1111', family: 6 },
+        ]);
+        await expect(validateGitUrl('https://legit.example/repo.git')).resolves.toBeUndefined();
+      });
+
+      it('rejects when the host cannot be resolved (fail closed)', async () => {
+        dnsLookupMock.mockRejectedValueOnce(new Error('ENOTFOUND'));
+        await expect(validateGitUrl('https://nonexistent.example/repo.git')).rejects.toThrow(
+          'Could not resolve git host',
+        );
+      });
+
+      it('rejects when the host resolves to no addresses (fail closed)', async () => {
+        dnsLookupMock.mockResolvedValueOnce([]);
+        await expect(validateGitUrl('https://empty.example/repo.git')).rejects.toThrow(
+          'Could not resolve git host',
+        );
+      });
+
+      it('does NOT perform a DNS lookup for literal-IP hosts (handled statically)', async () => {
+        dnsLookupMock.mockClear();
+        await expect(validateGitUrl('https://140.82.121.4/repo.git')).resolves.toBeUndefined();
+        await expect(validateGitUrl('http://10.0.0.1/repo.git')).rejects.toThrow(
+          'private/internal',
+        );
+        expect(dnsLookupMock).not.toHaveBeenCalled();
+      });
     });
   });
 
