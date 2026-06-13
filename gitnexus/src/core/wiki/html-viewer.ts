@@ -7,13 +7,71 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { createRequire } from 'node:module';
 import { sanitizeMermaidMarkdown } from './mermaid-sanitizer.js';
+
+const _require = createRequire(import.meta.url);
 
 interface ModuleTreeNode {
   name: string;
   slug: string;
   files: string[];
   children?: ModuleTreeNode[];
+}
+
+/**
+ * Browser builds of the libraries the viewer needs, resolved from this package's
+ * own dependencies (C1 — bundle inline, no external script src). Each is a
+ * self-contained UMD bundle that attaches its global to `window`:
+ *   - marked      → window.marked       (marked/marked.min.js)
+ *   - DOMPurify   → window.DOMPurify     (dompurify/dist/purify.min.js)
+ *   - mermaid     → window.mermaid       (mermaid/dist/mermaid.min.js; ends with
+ *                                         globalThis["mermaid"] = ...default)
+ * mermaid's min build performs zero dynamic chunk imports, so a single inlined
+ * file fully bundles it (the cost is a multi-MB index.html — accepted per the
+ * design decision).
+ */
+// Each entry is the package subpath of the browser build, resolved directly via
+// the package's `exports` map (dompurify only exposes `package.json`-less
+// subpaths; marked/mermaid allow `./*`). DOMPurify is loaded first so
+// window.DOMPurify is defined before the app script runs.
+const LIB_BROWSER_BUILDS: Array<{ name: string; subpath: string }> = [
+  { name: 'DOMPurify', subpath: 'dompurify/dist/purify.min.js' },
+  { name: 'marked', subpath: 'marked/marked.min.js' },
+  { name: 'mermaid', subpath: 'mermaid/dist/mermaid.min.js' },
+];
+
+/**
+ * Escape ONLY the `</script` tag-closing sequence in inlined JS so a string
+ * literal like `'</script>'` inside the library cannot prematurely close the
+ * surrounding <script> block. This is deliberately narrow — applying the
+ * builder's broad `</` → `<\/` transform to minified library code would corrupt
+ * valid JS (e.g. regex/division/JSX-ish `</` sequences). The browser un-escapes
+ * `<\/script` back to `</script` at parse time, so semantics are preserved.
+ */
+function escapeScriptClose(code: string): string {
+  return code.replace(/<\/(script)/gi, '<\\/$1');
+}
+
+/**
+ * Read and `</script>`-guard each library's browser build. Throws a clear error
+ * if a build is missing (it is a hard dependency of the offline viewer).
+ */
+async function readInlinedLibs(): Promise<Array<{ name: string; code: string }>> {
+  const libs: Array<{ name: string; code: string }> = [];
+  for (const { name, subpath } of LIB_BROWSER_BUILDS) {
+    let buildPath: string;
+    try {
+      buildPath = _require.resolve(subpath);
+    } catch (err) {
+      throw new Error(
+        `Wiki HTML viewer could not resolve ${name} (${subpath}). Is it installed as a gitnexus dependency? (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+    const raw = await fs.readFile(buildPath, 'utf-8');
+    libs.push({ name, code: escapeScriptClose(raw) });
+  }
+  return libs;
 }
 
 /**
@@ -46,7 +104,11 @@ export async function generateHTMLViewer(wikiDir: string, projectName: string): 
     pages[f.replace(/\.md$/, '')] = sanitizeMermaidMarkdown(content);
   }
 
-  const html = buildHTML(projectName, moduleTree, pages, meta);
+  // Read the inlined library builds (marked, mermaid, DOMPurify) so the viewer
+  // is fully self-contained and loads no external script src (C1).
+  const libs = await readInlinedLibs();
+
+  const html = buildHTML(projectName, moduleTree, pages, meta, libs);
   const outputPath = path.join(wikiDir, 'index.html');
   await fs.writeFile(outputPath, html, 'utf-8');
   return outputPath;
@@ -67,6 +129,7 @@ function buildHTML(
   moduleTree: ModuleTreeNode[],
   pages: Record<string, string>,
   meta: Record<string, unknown> | null,
+  libs: Array<{ name: string; code: string }>,
 ): string {
   // Embed data as JSON inside the HTML.
   // Escape </script> sequences so they don't prematurely close the <script> tag.
@@ -84,10 +147,16 @@ function buildHTML(
   parts.push('<meta charset="UTF-8">');
   parts.push('<meta name="viewport" content="width=device-width, initial-scale=1.0">');
   parts.push('<title>' + esc(projectName) + ' — Wiki</title>');
-  parts.push('<script src="https://cdn.jsdelivr.net/npm/marked@11.0.0/marked.min.js"><\/script>');
-  parts.push(
-    '<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>',
-  );
+  // Inline the library builds instead of loading them from a CDN (C1). Each lib
+  // is `</script>`-guarded (escapeScriptClose) so its own source can't break out
+  // of the <script> block; the broad escScript transform is intentionally NOT
+  // applied here (it would corrupt minified JS).
+  for (const lib of libs) {
+    parts.push(`<!-- ${esc(lib.name)} (bundled offline) -->`);
+    parts.push('<script>');
+    parts.push(lib.code);
+    parts.push('<\/script>');
+  }
   parts.push('<style>');
   parts.push(CSS);
   parts.push('</style>');
@@ -303,7 +372,10 @@ const JS_APP = `
       return;
     }
 
-    contentEl.innerHTML = marked.parse(md);
+    // LLM-generated markdown is derived from an untrusted repository — sanitize
+    // the rendered HTML with DOMPurify before inserting it (C2). The inlined
+    // DOMPurify build exposes window.DOMPurify.
+    contentEl.innerHTML = DOMPurify.sanitize(marked.parse(md));
 
     // Rewrite .md links to hash navigation
     var links = contentEl.querySelectorAll('a[href]');
