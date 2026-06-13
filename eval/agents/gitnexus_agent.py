@@ -18,6 +18,7 @@ Template structure (matches mini-swe-agent's expectations):
 
 import logging
 import re
+import shlex
 import time
 from enum import Enum
 from pathlib import Path
@@ -109,8 +110,10 @@ class GitNexusAgent(DefaultAgent):
 
         start = time.time()
         try:
+            # shlex.quote() ensures `pattern` (regex-extracted from agent output)
+            # is passed as a single literal argument, preventing shell injection.
             augment_result = self.env.execute({
-                "command": f'gitnexus-augment "{pattern}" 2>&1 || true',
+                "command": f"gitnexus-augment {shlex.quote(pattern)} 2>&1 || true",
                 "timeout": self.config.augment_timeout,
             })
             elapsed = time.time() - start
