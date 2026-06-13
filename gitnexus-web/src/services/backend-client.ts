@@ -230,29 +230,68 @@ export function streamSSE<T = unknown>(url: string, handlers: SSEHandlers<T>): A
 let _backendUrl = 'http://localhost:4747';
 
 /**
- * Validate that a backend URL is a safe http:// or https:// origin before
- * storing it as the fetch target base (CodeQL js/client-side-request-forgery).
- *
- * Throws if the URL uses a non-HTTP scheme (e.g. javascript:, data:, file://).
- * All other well-formed http/https URLs are accepted — the client intentionally
- * supports connecting to remote GitNexus servers, not just localhost.
+ * Predicate form of the backend-URL guard (R8): returns true only for a
+ * well-formed http:// or https:// URL. Use this on PASSIVE inputs that should
+ * silently fall back to a default — a persisted localStorage value or the
+ * deploy-time `window.__GITNEXUS_CONFIG__.backendUrl` override — where a
+ * `javascript:`/`data:`/`file:`/blank/malformed value must never become the
+ * fetch target (CodeQL js/client-side-request-forgery). Remote http(s)
+ * backends are intentionally accepted: this is a scheme/format check, not a
+ * localhost allowlist.
  */
-export function validateBackendUrl(url: string): void {
+export function isValidBackendUrl(url: string): boolean {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    // Do not echo raw input — it may contain credentials.
-    throw new Error('Invalid backend URL: must be a well-formed http:// or https:// URL');
+    return false;
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+}
+
+/**
+ * Validate that a backend URL is a safe http:// or https:// origin before
+ * storing it as the fetch target base (CodeQL js/client-side-request-forgery).
+ *
+ * Throws if the URL uses a non-HTTP scheme (e.g. javascript:, data:, file://)
+ * or is malformed. Use the throwing form for ACTIVE, user-entered URLs
+ * (`setBackendUrl`) so the caller can surface the error; use `isValidBackendUrl`
+ * / `sanitizeBackendUrl` for passive config/persisted values. All other
+ * well-formed http/https URLs are accepted — the client intentionally supports
+ * connecting to remote GitNexus servers, not just localhost.
+ */
+export function validateBackendUrl(url: string): void {
+  if (isValidBackendUrl(url)) return;
+  // Re-parse only to distinguish "malformed" from "bad scheme" for the message;
+  // never echo the raw input or full URL — it may carry credentials.
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(url);
+  } catch {
+    parsed = null;
+  }
+  if (parsed) {
     // Use parsed.protocol only (scheme), not the full URL, to avoid leaking credentials.
     throw new Error(`Backend URL must use http:// or https:// (got ${parsed.protocol})`);
   }
+  throw new Error('Invalid backend URL: must be a well-formed http:// or https:// URL');
+}
+
+/**
+ * Return `url` (trailing slash stripped) when it is a valid http(s) backend URL,
+ * otherwise return `fallback`. Non-throwing counterpart of `validateBackendUrl`
+ * for passive inputs (persisted localStorage / injected window config) — R8.
+ */
+export function sanitizeBackendUrl(url: string | null | undefined, fallback: string): string {
+  if (typeof url !== 'string') return fallback;
+  const trimmed = url.replace(/\/$/, '');
+  return isValidBackendUrl(trimmed) ? trimmed : fallback;
 }
 
 export const setBackendUrl = (url: string): void => {
   const trimmed = url.replace(/\/$/, '');
+  // Throws on a dangerous-scheme / malformed URL; `_backendUrl` is left
+  // unchanged so a rejected value never becomes the fetch target.
   validateBackendUrl(trimmed);
   _backendUrl = trimmed;
 };

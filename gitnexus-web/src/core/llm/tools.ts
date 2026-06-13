@@ -592,22 +592,32 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           return `- ${label} (${steps} steps)`;
         });
 
+        // Cluster/process labels, descriptions, and dependency/critical-path
+        // lines are all repo-derived (untrusted) graph data, so the data rows go
+        // inside the instruction-boundary fence. Our own section headers and the
+        // markdown table column headers are trusted labels and stay outside it
+        // (same A2/R3 pattern as search/grep/cypher/read). One fence per section
+        // keeps the headers readable while still defanging any closing token an
+        // adversarial label might contain. See R1.
+        const fenceOrNone = (lines: string[]): string =>
+          lines.length > 0 ? wrapUntrusted(lines.join('\n')) : '- None found';
+
         return [
           `CLUSTERS (${clusters.length} total):`,
           `| Cluster | Symbols | Cohesion | Description |`,
           `| --- | --- | --- | --- |`,
-          ...clusterLines,
+          fenceOrNone(clusterLines),
           ``,
           `PROCESSES (${processes.length} total):`,
           `| Process | Steps | Type | Clusters |`,
           `| --- | --- | --- | --- |`,
-          ...processLines,
+          fenceOrNone(processLines),
           ``,
           `CLUSTER DEPENDENCIES:`,
-          ...(depLines.length > 0 ? depLines : ['- None found']),
+          fenceOrNone(depLines),
           ``,
           `CRITICAL PATHS:`,
-          ...(criticalLines.length > 0 ? criticalLines : ['- None found']),
+          fenceOrNone(criticalLines),
         ].join('\n');
       } catch (error) {
         return `Overview error: ${error instanceof Error ? error.message : String(error)}`;
@@ -724,8 +734,12 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           return `- ${clabel}${desc ? ` — ${desc}` : ''}`;
         });
 
-        return [
-          `PROCESS: ${label}`,
+        // Process label, type, step names/paths, and touched-cluster labels are
+        // all repo-derived (untrusted), so the detail body is confined to the
+        // instruction-boundary fence; the `PROCESS` framing header is our own
+        // trusted label and stays outside it (A2/R3). See R1.
+        const body = [
+          `Label: ${label}`,
           `Type: ${ptype || 'n/a'}`,
           `Steps: ${stepCount ?? steps.length}`,
           ``,
@@ -735,6 +749,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           `CLUSTERS TOUCHED:`,
           ...(clusterLines.length > 0 ? clusterLines : ['- None found']),
         ].join('\n');
+        return `PROCESS detail:\n${wrapUntrusted(body)}`;
       }
 
       if (resolvedType === 'cluster') {
@@ -775,8 +790,11 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           return `- ${plabel} (${steps} steps)`;
         });
 
-        return [
-          `CLUSTER: ${label}`,
+        // Cluster label/description, member names/paths, and touching-process
+        // labels are repo-derived (untrusted); fence the detail body and keep
+        // only the `CLUSTER` framing header outside (A2/R3). See R1.
+        const body = [
+          `Label: ${label}`,
           `Symbols: ${symbolCount ?? members.length}`,
           `Cohesion: ${cohesion !== null && cohesion !== undefined ? Number(cohesion).toFixed(2) : 'n/a'}`,
           `Description: ${description || 'n/a'}`,
@@ -787,6 +805,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           `PROCESSES TOUCHING THIS CLUSTER:`,
           ...(processLines.length > 0 ? processLines : ['- None found']),
         ].join('\n');
+        return `CLUSTER detail:\n${wrapUntrusted(body)}`;
       }
 
       if (resolvedType === 'symbol') {
@@ -863,8 +882,14 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           }
         }
 
-        return [
-          `SYMBOL: ${nodeType} ${name}`,
+        // Symbol name, id, file path, cluster label/description, process labels,
+        // and connection names are all repo-derived (untrusted); fence the detail
+        // body and keep only the `SYMBOL` framing header outside (A2/R3). The
+        // `nodeType` in the header is already constrained to the validLabel
+        // allowlist above, but it rides inside the fence with the rest. See R1.
+        const body = [
+          `Type: ${nodeType}`,
+          `Name: ${name}`,
           `ID: ${nodeId}`,
           `File: ${filePath || 'n/a'}`,
           `Cluster: ${clusterLabel}${clusterDesc ? ` — ${clusterDesc}` : ''}`,
@@ -875,6 +900,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           `CONNECTIONS:`,
           connections,
         ].join('\n');
+        return `SYMBOL detail:\n${wrapUntrusted(body)}`;
       }
 
       return `Unable to explore "${target}".`;
