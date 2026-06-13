@@ -23,7 +23,7 @@ describe('Graph-RAG impact risk contract', () => {
 
   it('renders failed enrichment as unavailable and fails the risk gate closed', async () => {
     const executeQuery = vi.fn(async (query: string) => {
-      if (query.includes("WHERE n.name = 'target'")) {
+      if (query.includes('WHERE n.name = $target')) {
         return [{ id: 'target-id', nodeType: 'Function', filePath: 'src/target.ts' }];
       }
       if (query.includes('MATCH (affected)-[r:CodeRelation]->(target)')) {
@@ -59,7 +59,7 @@ describe('Graph-RAG impact risk contract', () => {
 
   it('preserves proved CRITICAL risk when the cluster query fails', async () => {
     const executeQuery = vi.fn(async (query: string) => {
-      if (query.includes("WHERE n.name = 'target'")) {
+      if (query.includes('WHERE n.name = $target')) {
         return [{ id: 'target-id', nodeType: 'Function', filePath: 'src/target.ts' }];
       }
       if (query.includes('MATCH (affected)-[r:CodeRelation]->(target)')) {
@@ -103,7 +103,7 @@ describe('Graph-RAG impact risk contract', () => {
 
   it('does not invent direct/indirect cluster classification after its query fails', async () => {
     const executeQuery = vi.fn(async (query: string) => {
-      if (query.includes("WHERE n.name = 'target'")) {
+      if (query.includes('WHERE n.name = $target')) {
         return [{ id: 'target-id', nodeType: 'Function', filePath: 'src/target.ts' }];
       }
       if (query.includes('MATCH (affected)-[r:CodeRelation]->(target)')) {
@@ -139,10 +139,10 @@ describe('Graph-RAG impact risk contract', () => {
 
   it('treats successful File expansion as comparable because enrichment runs on member symbols', async () => {
     const executeQuery = vi.fn(async (query: string) => {
-      if (query.includes("n.filePath CONTAINS 'src/target.ts'")) {
+      if (query.includes('n.filePath CONTAINS $target')) {
         return [{ id: 'file-id', nodeType: 'File', filePath: 'src/target.ts' }];
       }
-      if (query.includes("callee.filePath = 'src/target.ts'")) {
+      if (query.includes('callee.filePath = $targetFilePath')) {
         return [
           {
             id: 'caller-id',
@@ -178,7 +178,7 @@ describe('Graph-RAG impact risk contract', () => {
 
   it('surfaces the 500-symbol enrichment cap as partial', async () => {
     const executeQuery = vi.fn(async (query: string) => {
-      if (query.includes("WHERE n.name = 'target'")) {
+      if (query.includes('WHERE n.name = $target')) {
         return [{ id: 'target-id', nodeType: 'Function', filePath: 'src/target.ts' }];
       }
       const depth = query.includes('3 AS depth') ? 3 : query.includes('2 AS depth') ? 2 : 1;

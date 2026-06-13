@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { AppStateProvider, useAppState } from '../../src/hooks/useAppState';
-import { getActiveProviderConfig } from '../../src/core/llm/settings-service';
+import { getProviderConfigFromSettings } from '../../src/core/llm/settings-service';
 import { buildCodebaseContext, type CodebaseContext } from '../../src/core/llm/context-builder';
 
 // Capture initializeAgent's observable seam: buildCodebaseContext receives the
@@ -31,7 +31,7 @@ vi.mock('../../src/core/llm/settings-service', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/llm/settings-service')>();
   // Wrap with the real implementation so tests without an explicit override
   // keep today's no-provider (null) behavior.
-  return { ...actual, getActiveProviderConfig: vi.fn(actual.getActiveProviderConfig) };
+  return { ...actual, getProviderConfigFromSettings: vi.fn(actual.getProviderConfigFromSettings) };
 });
 
 afterEach(() => {
@@ -203,7 +203,7 @@ describe('loadGraphAnyway (chat-only escape hatch, #2178)', () => {
   });
 
   it('re-initializes the agent with the looked-up display name and the path identity', async () => {
-    vi.mocked(getActiveProviderConfig).mockReturnValue({
+    vi.mocked(getProviderConfigFromSettings).mockReturnValue({
       provider: 'openai',
       model: 'gpt-4o',
       apiKey: 'test-key',
@@ -248,7 +248,7 @@ describe('loadGraphAnyway (chat-only escape hatch, #2178)', () => {
   });
 
   it('falls back to the identity basename for the agent prompt when the repo list misses it', async () => {
-    vi.mocked(getActiveProviderConfig).mockReturnValue({
+    vi.mocked(getProviderConfigFromSettings).mockReturnValue({
       provider: 'openai',
       model: 'gpt-4o',
       apiKey: 'test-key',

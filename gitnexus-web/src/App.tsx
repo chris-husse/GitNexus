@@ -10,7 +10,7 @@ import { StatusBar } from './components/StatusBar';
 import { FileTreePanel } from './components/FileTreePanel';
 import { CodeReferencesPanel } from './components/CodeReferencesPanel';
 import { ExecutionDashboard } from './components/ExecutionDashboard';
-import { getActiveProviderConfig } from './core/llm/settings-service';
+import { isSettingsConfigured } from './core/llm/settings-service';
 import { buildGraphFromConnectResult } from './lib/apply-connect-result';
 import {
   connectToServer,
@@ -77,6 +77,7 @@ const AppContent = () => {
     setAvailableRepos,
     switchRepo,
     setCurrentRepo,
+    llmSettings,
   } = useAppState();
 
   const graphCanvasRef = useRef<GraphCanvasHandle>(null);
@@ -163,7 +164,9 @@ const AppContent = () => {
       // Initialize agent with backend queries, then start embeddings. Pass the
       // chat-only flag so the agent's prompt matches the loaded/skipped graph (#2178).
       try {
-        if (getActiveProviderConfig()) {
+        // Use the in-memory settings (session's memory-only key); storage has
+        // no key after R10.
+        if (isSettingsConfigured(llmSettings)) {
           await initializeAgent(projectName, { chatOnly: result.graphSkipped, repo: repoIdentity });
         }
         startEmbeddingsWithFallback();
@@ -180,6 +183,7 @@ const AppContent = () => {
       setCurrentRepo,
       initializeAgent,
       startEmbeddingsWithFallback,
+      llmSettings,
     ],
   );
 
