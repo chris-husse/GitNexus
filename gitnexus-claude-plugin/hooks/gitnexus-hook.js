@@ -218,9 +218,10 @@ let unguardedCliWarned = false;
  * any dependence on the (caller-supplied) cwd for resolution, and rejecting
  * un-normalized paths refuses values that smuggle `..` traversal or redundant
  * separators that `path.normalize` would otherwise collapse. A value that
- * fails this check is ignored (the caller falls through to PATH/`which`/npx
- * resolution); we never throw, so a malformed override degrades to the normal
- * resolution path rather than disabling the augment.
+ * fails this check is ignored (the caller falls through to PATH/`which`
+ * resolution, and skips augmentation if no installed `gitnexus` is found);
+ * we never throw, so a malformed override degrades to the normal resolution
+ * path rather than disabling the augment.
  *
  * NOTE: this does NOT make an untrusted value safe — it only narrows a trusted
  * value to a predictable, unambiguous form. The existence check stays in the
@@ -241,47 +242,39 @@ function isTrustedHookCliPath(value) {
  * Spawn a gitnexus CLI command synchronously.
  * Detects binary on PATH once, then runs exactly once.
  *
+ * Resolution order (no auto-install — #R4): use the operator-provided
+ * GITNEXUS_HOOK_CLI_PATH override (round-1 hardened) first, else a `gitnexus`
+ * already on PATH. When NEITHER is available the function does NOT download or
+ * execute anything — there is no `npx -y gitnexus` silent-install fallback. It
+ * instead returns a synthetic "skip" result shaped like spawnSync's return
+ * value: `{ error: <Error>, status: null, stdout: '', stderr: '' }`. The
+ * caller treats `child.error || child.status !== 0` as "no augmentation", so
+ * this makes augmentation a graceful no-op when no installed CLI is found. We
+ * return (never throw) so the hook stays silent on the normal path; the missing
+ * binary is a routine condition, not an error to surface.
+ *
  * SECURITY: Never use shell: true with user-controlled arguments.
  * On Windows, invoke gitnexus.cmd directly (no shell needed).
  *
  * Unix orphan containment (#2163 follow-up): the augment CLI is the
- * longest-lived hook child (inner spawnSync timeout 7s locally, 12s via
- * npx), so on Unix every CLI-running branch gets the same SIGKILL-surviving
- * coreutils `timeout` wrapper as the probe's lsof/ps (the cheap which/where
- * PATH check stays unwrapped). The wrapper budget is ceil(inner/1000)+1
- * seconds — STRICTLY greater than the inner spawnSync timeout, so on the
- * supervised path Node's SIGTERM always fires first and the existing
- * error/status contract is untouched. Once the hook itself has been
- * SIGKILLed (exactly the orphan case the wrapper exists for), the guard
- * semantics differ per branch:
- *   - direct exec (GITNEXUS_HOOK_CLI_PATH / PATH-installed `gitnexus`; the
- *     CLI is the guard's CHILD): `-k 1` TERM-first — a SIGTERM-immune CLI
- *     can hold the guard ~1s past the inner timeout before the `-k` SIGKILL
- *     escalation reaps it.
- *   - npx (the CLI is a GRANDCHILD: guard → npx → CLI): `-s KILL` — the
- *     budget expiry SIGKILLs the whole process group outright. TERM-first
- *     would kill only the obedient npx parent, making `timeout` reap it and
- *     return before the `-k` escalation ever fires, stranding a
- *     SIGTERM-immune CLI grandchild unbounded (reproduced on coreutils
- *     9.x). `-k 1` is retained alongside `-s KILL` as a harmless belt: with
- *     `-s KILL` the `-k` escalation signal is also KILL. Two residual gaps
- *     on this branch, both bounded by "no worse than pre-fix" (where the
- *     grandchild received no signal at all): the group-wide SIGKILL is
- *     coreutils semantics — a busybox `timeout` passes the self-test (it
- *     has `-k` and propagates exit status) but signals only its direct
- *     child, so a busybox guard cannot reach the grandchild; and on the
- *     SUPERVISED path (hook alive, inner spawnSync timeout SIGTERMs the
- *     guard) coreutils forwards TERM rather than the `-s` signal, npx dies,
- *     and the guard exits before any KILL fires — so a SIGTERM-immune CLI
- *     grandchild still escapes in those two cases.
+ * longest-lived hook child (inner spawnSync timeout 7s locally), so on Unix
+ * every CLI-running branch gets the same SIGKILL-surviving coreutils `timeout`
+ * wrapper as the probe's lsof/ps (the cheap which/where PATH check stays
+ * unwrapped). The wrapper budget is ceil(inner/1000)+1 seconds — STRICTLY
+ * greater than the inner spawnSync timeout, so on the supervised path Node's
+ * SIGTERM always fires first and the existing error/status contract is
+ * untouched. Once the hook itself has been SIGKILLed (exactly the orphan case
+ * the wrapper exists for), both retained branches are direct execs
+ * (GITNEXUS_HOOK_CLI_PATH / PATH-installed `gitnexus`; the CLI is the guard's
+ * CHILD): `-k 1` TERM-first — a SIGTERM-immune CLI can hold the guard ~1s past
+ * the inner timeout before the `-k` SIGKILL escalation reaps it.
  * If the sibling probe predates the resolveUnixGuardTimeout export (version
  * skew), the adapter degrades to the unwrapped invocation instead of
  * throwing. Windows is deliberately NOT wrapped — there is no coreutils
  * timeout to resolve there and the resolver's self-test spawns /bin/sh — so
- * on win32 (the gitnexus.cmd / npx.cmd paths) and whenever the guard
- * resolves to null (e.g. macOS without Homebrew coreutils — reported once
- * under GITNEXUS_DEBUG) the argv stays byte-identical to the pre-wrap
- * invocation.
+ * on win32 (the gitnexus.cmd path) and whenever the guard resolves to null
+ * (e.g. macOS without Homebrew coreutils — reported once under GITNEXUS_DEBUG)
+ * the argv stays byte-identical to the pre-wrap invocation.
  */
 function runGitNexusCli(args, cwd, timeout) {
   const isWin = process.platform === 'win32';
@@ -304,7 +297,8 @@ function runGitNexusCli(args, cwd, timeout) {
   // Accept the operator override only when it is an absolute, normalized path
   // (isTrustedHookCliPath) AND points at an existing file. An out-of-shape or
   // missing value is silently ignored — control falls through to the
-  // PATH/`which`/npx resolution below (we never throw on a bad override).
+  // PATH/`which` resolution below, and finally to the no-op skip (we never
+  // throw on a bad override).
   if (isTrustedHookCliPath(hookCli) && fs.existsSync(String(hookCli))) {
     const [cmd, cmdArgs] = guard
       ? [
@@ -356,33 +350,21 @@ function runGitNexusCli(args, cwd, timeout) {
       windowsHide: true,
     });
   }
-  // npx fallback needs shell on Windows since npx is a .cmd script. The
-  // wrapped arm leads with `-s KILL` (NOT TERM-first like the direct
-  // branches above): the CLI here is a grandchild behind npx — see the
-  // docblock.
-  const [cmd, cmdArgs] = guard
-    ? [
-        guard,
-        [
-          '-s',
-          'KILL',
-          '-k',
-          '1',
-          String(Math.ceil((timeout + 5000) / 1000) + 1),
-          'npx',
-          '-y',
-          'gitnexus',
-          ...args,
-        ],
-      ]
-    : [isWin ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', ...args]];
-  return spawnSync(cmd, cmdArgs, {
-    encoding: 'utf-8',
-    timeout: timeout + 5000,
-    cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
+
+  // No installed CLI: neither a trusted GITNEXUS_HOOK_CLI_PATH nor a `gitnexus`
+  // on PATH. We deliberately do NOT fall back to `npx -y gitnexus` (#R4): that
+  // silently downloaded and executed an unpinned package from npm. Instead,
+  // return a synthetic result shaped like spawnSync's so the caller's
+  // `!child.error && child.status === 0` guard treats this as "no
+  // augmentation" and skips gracefully — same contract as a failed/errored
+  // spawn, without installing anything. We return (never throw) to keep the
+  // hook silent on this normal, expected path.
+  return {
+    error: new Error('gitnexus CLI not found; skipping augment'),
+    status: null,
+    stdout: '',
+    stderr: '',
+  };
 }
 
 /**

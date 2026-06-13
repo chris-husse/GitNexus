@@ -2,9 +2,36 @@
 export const ERROR_RESET_DELAY_MS = 3000;
 export const BACKEND_URL_DEBOUNCE_MS = 500;
 
-export const DEFAULT_BACKEND_URL =
-  (typeof window !== 'undefined' && window.__GITNEXUS_CONFIG__?.backendUrl) ||
-  'http://localhost:4747';
+const LOCALHOST_BACKEND_URL = 'http://localhost:4747';
+
+/**
+ * Resolve the deploy-time backend-URL override into a safe default (R8). The
+ * `window.__GITNEXUS_CONFIG__.backendUrl` value is attacker-influenceable (it
+ * is injected into the page and can be tampered with), so a `javascript:` /
+ * `data:` / `file:` / blank / malformed value must fall back to the localhost
+ * default rather than becoming the fetch-target base. Remote http(s) backends
+ * are intentionally honored — this is a scheme/format check, not a localhost
+ * allowlist. Kept self-contained (no import from backend-client) to avoid a
+ * config↔service import cycle.
+ */
+export function resolveDefaultBackendUrl(
+  configUrl: string | null | undefined,
+  fallback: string = LOCALHOST_BACKEND_URL,
+): string {
+  if (typeof configUrl !== 'string') return fallback;
+  let parsed: URL;
+  try {
+    parsed = new URL(configUrl);
+  } catch {
+    return fallback;
+  }
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? configUrl : fallback;
+}
+
+export const DEFAULT_BACKEND_URL = resolveDefaultBackendUrl(
+  typeof window !== 'undefined' ? window.__GITNEXUS_CONFIG__?.backendUrl : undefined,
+  LOCALHOST_BACKEND_URL,
+);
 export const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 export const DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 

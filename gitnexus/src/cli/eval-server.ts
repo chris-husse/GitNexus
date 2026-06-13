@@ -61,6 +61,62 @@ export function validateHost(raw: string): string | null {
   return null;
 }
 
+// ─── Auth (security round 3, R7) ───────────────────────────────────────
+// The server defaults to 127.0.0.1, but the /tool/* dispatch and /shutdown had
+// no auth. An optional bearer token (GITNEXUS_EVAL_SERVER_TOKEN) gates those
+// endpoints as defense-in-depth for the opt-in `--host 0.0.0.0` case. /health
+// always stays open. Loopback dev flow is unchanged when no token is set.
+
+/**
+ * Is `host` a loopback address (this machine only)? Used to decide whether to
+ * warn about unauthenticated network exposure. IPv4 loopback is the whole
+ * 127.0.0.0/8 block; IPv6 loopback is ::1; "localhost" resolves to loopback.
+ */
+export function isLoopbackHost(host: string): boolean {
+  if (host === 'localhost') return true;
+  if (host === '::1') return true;
+  if (isIPv4(host)) return host.startsWith('127.');
+  return false;
+}
+
+/**
+ * Resolve the configured bearer token, or undefined if auth is disabled.
+ * An empty / whitespace-only env value is treated as "no token" so a blank
+ * export does not silently lock everyone out (and cannot be matched by a
+ * blank header).
+ */
+export function resolveEvalServerToken(): string | undefined {
+  const raw = process.env.GITNEXUS_EVAL_SERVER_TOKEN;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Endpoints that require auth when a token is configured: /shutdown and /tool/*. */
+export function isProtectedRequest(req: http.IncomingMessage): boolean {
+  const url = req.url ?? '';
+  if (req.method === 'POST' && url === '/shutdown') return true;
+  if (req.method === 'POST' && /^\/tool\/\w+$/.test(url)) return true;
+  return false;
+}
+
+/**
+ * Authorize a request. When no token is configured, everything is allowed
+ * (unchanged loopback behavior). When a token IS configured, protected
+ * endpoints require `Authorization: Bearer <token>` (scheme case-insensitive);
+ * /health and other unprotected routes are always allowed.
+ */
+export function isAuthorized(req: http.IncomingMessage, token: string | undefined): boolean {
+  if (!token) return true;
+  if (!isProtectedRequest(req)) return true;
+
+  const header = req.headers['authorization'];
+  if (typeof header !== 'string') return false;
+  const match = /^Bearer[ ]+(.+)$/i.exec(header.trim());
+  if (!match) return false;
+  return match[1].trim() === token;
+}
+
 // ─── Text Formatters ──────────────────────────────────────────────────
 // Convert structured JSON results into compact, LLM-friendly text.
 // Design: minimize tokens, maximize actionability.
@@ -401,68 +457,56 @@ function getNextStepHint(toolName: string): string {
   }
 }
 
-// ─── Server ───────────────────────────────────────────────────────────
+// ─── Request handler ───────────────────────────────────────────────────
 
-export async function evalServerCommand(options?: EvalServerOptions): Promise<void> {
-  const port = parseInt(options?.port || '4848');
-  const idleTimeoutSec = parseInt(options?.idleTimeout || '0');
+/** Minimal backend surface the request handler needs (subset of LocalBackend). */
+export interface EvalRequestBackend {
+  callTool(name: string, args: Record<string, any>): Promise<any>;
+  disconnect(): Promise<void>;
+}
 
-  const rawHost = options?.host ?? '127.0.0.1';
-  const host = validateHost(rawHost);
-  if (!host) {
-    cliError(
-      `Invalid --host value "${rawHost}":\n` +
-        `  Must be an IP address or "localhost".\n\n` +
-        `  Examples:\n` +
-        `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
-        `    gitnexus eval-server --host 0.0.0.0      (all network interfaces)\n` +
-        `    gitnexus eval-server --host 192.168.1.5  (specific interface)\n` +
-        `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
-      { flag: '--host', value: rawHost },
-    );
-    process.exit(1);
-  }
+export interface EvalRequestHandlerOptions {
+  backend: EvalRequestBackend;
+  /** Repo names reported by /health. */
+  repoNames: string[];
+  /** Bearer token gating /tool/* and /shutdown; undefined disables auth. */
+  authToken: string | undefined;
+  /** Called on every request to reset the idle timer (optional). */
+  onActivity?: () => void;
+  /** Invoked after a successful /shutdown response; performs the real teardown. */
+  onShutdown: () => void;
+}
 
-  const backend = new LocalBackend();
-  const ok = await backend.init();
+/**
+ * Build the HTTP request handler. Extracted from evalServerCommand so the auth
+ * gate (R7) and dispatch are testable against a real socket with a mock backend
+ * — the shutdown teardown is injected via onShutdown so tests never process.exit.
+ */
+export function createEvalRequestHandler(
+  opts: EvalRequestHandlerOptions,
+): (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void> {
+  const { backend, repoNames, authToken, onActivity, onShutdown } = opts;
 
-  if (!ok) {
-    // Operator-actionable but the server cannot start; warn-level so log
-    // aggregators don't trip error alerts on a configuration miss. Use
-    // cliWarn so the diagnostic reaches stderr synchronously before
-    // process.exit() — direct logger.warn would be lost to the buffered
-    // pino destination on hard exit (skips beforeExit flush).
-    cliWarn('GitNexus eval-server: No indexed repositories found. Run: gitnexus analyze');
-    process.exit(1);
-  }
-
-  const repos = await backend.listRepos();
-  logger.info(
-    { repoCount: repos.length, repos: repos.map((r) => r.name) },
-    'GitNexus eval-server: repos loaded',
-  );
-
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function resetIdleTimer() {
-    if (idleTimeoutSec <= 0) return;
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(async () => {
-      logger.info({ idleTimeoutSec }, 'GitNexus eval-server: idle timeout reached, shutting down');
-      await backend.disconnect();
-      process.exit(0);
-    }, idleTimeoutSec * 1000);
-  }
-
-  const server = http.createServer(async (req, res) => {
-    resetIdleTimer();
+  return async (req, res) => {
+    onActivity?.();
 
     try {
+      // R7 — gate protected endpoints (/tool/*, /shutdown) on the bearer token
+      // BEFORE any side effects (the /shutdown handler tears down the server).
+      // /health and unprotected routes pass through unchanged.
+      if (!isAuthorized(req, authToken)) {
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('WWW-Authenticate', 'Bearer');
+        res.writeHead(401);
+        res.end('Error: Unauthorized. Provide Authorization: Bearer <token>.');
+        return;
+      }
+
       // Health check
       if (req.method === 'GET' && req.url === '/health') {
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(200);
-        res.end(JSON.stringify({ status: 'ok', repos: repos.map((r) => r.name) }));
+        res.end(JSON.stringify({ status: 'ok', repos: repoNames }));
         return;
       }
 
@@ -471,11 +515,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(200);
         res.end(JSON.stringify({ status: 'shutting_down' }));
-        setTimeout(async () => {
-          await backend.disconnect();
-          server.close();
-          process.exit(0);
-        }, 100);
+        onShutdown();
         return;
       }
 
@@ -517,7 +557,90 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       res.writeHead(500);
       res.end(`Error: ${err.message || 'Internal error'}`);
     }
-  });
+  };
+}
+
+// ─── Server ───────────────────────────────────────────────────────────
+
+export async function evalServerCommand(options?: EvalServerOptions): Promise<void> {
+  const port = parseInt(options?.port || '4848');
+  const idleTimeoutSec = parseInt(options?.idleTimeout || '0');
+
+  const rawHost = options?.host ?? '127.0.0.1';
+  const host = validateHost(rawHost);
+  if (!host) {
+    cliError(
+      `Invalid --host value "${rawHost}":\n` +
+        `  Must be an IP address or "localhost".\n\n` +
+        `  Examples:\n` +
+        `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
+        `    gitnexus eval-server --host 0.0.0.0      (all network interfaces)\n` +
+        `    gitnexus eval-server --host 192.168.1.5  (specific interface)\n` +
+        `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
+      { flag: '--host', value: rawHost },
+    );
+    process.exit(1);
+  }
+
+  // R7 — optional bearer-token auth for /tool/* and /shutdown. When binding a
+  // non-loopback host without a token, warn loudly that the server is
+  // unauthenticated on the network. Loopback default is unchanged.
+  const authToken = resolveEvalServerToken();
+  if (!isLoopbackHost(host) && !authToken) {
+    cliWarn(
+      `GitNexus eval-server: binding non-loopback host "${host}" WITHOUT authentication.\n` +
+        `  /tool/* and /shutdown are reachable unauthenticated from the network.\n` +
+        `  Set GITNEXUS_EVAL_SERVER_TOKEN=<token> to require "Authorization: Bearer <token>".`,
+      { host, unauthenticated: true },
+    );
+  }
+
+  const backend = new LocalBackend();
+  const ok = await backend.init();
+
+  if (!ok) {
+    // Operator-actionable but the server cannot start; warn-level so log
+    // aggregators don't trip error alerts on a configuration miss. Use
+    // cliWarn so the diagnostic reaches stderr synchronously before
+    // process.exit() — direct logger.warn would be lost to the buffered
+    // pino destination on hard exit (skips beforeExit flush).
+    cliWarn('GitNexus eval-server: No indexed repositories found. Run: gitnexus analyze');
+    process.exit(1);
+  }
+
+  const repos = await backend.listRepos();
+  logger.info(
+    { repoCount: repos.length, repos: repos.map((r) => r.name) },
+    'GitNexus eval-server: repos loaded',
+  );
+
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function resetIdleTimer() {
+    if (idleTimeoutSec <= 0) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(async () => {
+      logger.info({ idleTimeoutSec }, 'GitNexus eval-server: idle timeout reached, shutting down');
+      await backend.disconnect();
+      process.exit(0);
+    }, idleTimeoutSec * 1000);
+  }
+
+  const server = http.createServer(
+    createEvalRequestHandler({
+      backend,
+      repoNames: repos.map((r) => r.name),
+      authToken,
+      onActivity: resetIdleTimer,
+      onShutdown: () => {
+        setTimeout(async () => {
+          await backend.disconnect();
+          server.close();
+          process.exit(0);
+        }, 100);
+      },
+    }),
+  );
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {

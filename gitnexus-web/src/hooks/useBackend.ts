@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { probeBackend, setBackendUrl as setServiceUrl } from '../services/backend-client';
+import {
+  probeBackend,
+  setBackendUrl as setServiceUrl,
+  sanitizeBackendUrl,
+} from '../services/backend-client';
 import { DEFAULT_BACKEND_URL } from '../config/ui-constants';
 
 // ── localStorage keys ────────────────────────────────────────────────────────
@@ -28,7 +32,12 @@ export interface UseBackendResult {
 export function useBackend(): UseBackendResult {
   const [backendUrl] = useState<string>(() => {
     try {
-      return localStorage.getItem(LS_URL_KEY) ?? DEFAULT_BACKEND_URL;
+      // A persisted backend URL is attacker-influenceable (anything with write
+      // access to localStorage). Validate the scheme/format before it becomes
+      // the fetch target; fall back to the (already-validated) default on a
+      // dangerous-scheme / malformed value so the mount-time setServiceUrl call
+      // can never throw on poisoned storage (R8).
+      return sanitizeBackendUrl(localStorage.getItem(LS_URL_KEY), DEFAULT_BACKEND_URL);
     } catch {
       return DEFAULT_BACKEND_URL;
     }

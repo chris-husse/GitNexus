@@ -73,10 +73,14 @@ gitnexus-query() {
         return 1
     fi
 
-    local args="{\"query\": \"$query\""
-    [ -n "$task_context" ] && args="$args, \"task_context\": \"$task_context\""
-    [ -n "$goal" ] && args="$args, \"goal\": \"$goal\""
-    args="$args}"
+    # Build the JSON body with jq so values are safely escaped (no shell
+    # interpolation — a value with ", \, or a newline cannot break out).
+    # Optional fields are only included when non-empty (preserves prior behavior).
+    local args
+    args="$(jq -ac -n --arg query "$query" --arg task_context "$task_context" --arg goal "$goal" \
+        '{query: $query}
+         + (if $task_context != "" then {task_context: $task_context} else {} end)
+         + (if $goal != "" then {goal: $goal} else {} end)')"
 
     _gitnexus_call query "$args"
 }
@@ -95,9 +99,11 @@ gitnexus-context() {
         return 1
     fi
 
-    local args="{\"name\": \"$name\""
-    [ -n "$file_path" ] && args="$args, \"file_path\": \"$file_path\""
-    args="$args}"
+    # Build the JSON body with jq so values are safely escaped (see gitnexus-query).
+    local args
+    args="$(jq -ac -n --arg name "$name" --arg file_path "$file_path" \
+        '{name: $name}
+         + (if $file_path != "" then {file_path: $file_path} else {} end)')"
 
     _gitnexus_call context "$args"
 }
@@ -119,7 +125,12 @@ gitnexus-impact() {
         return 1
     fi
 
-    _gitnexus_call impact "{\"target\": \"$target\", \"direction\": \"$direction\"}"
+    # Build the JSON body with jq so values are safely escaped (see gitnexus-query).
+    local args
+    args="$(jq -ac -n --arg target "$target" --arg direction "$direction" \
+        '{target: $target, direction: $direction}')"
+
+    _gitnexus_call impact "$args"
 }
 
 gitnexus-cypher() {
@@ -138,7 +149,11 @@ gitnexus-cypher() {
         return 1
     fi
 
-    _gitnexus_call cypher "{\"query\": \"$query\"}"
+    # Build the JSON body with jq so the value is safely escaped (see gitnexus-query).
+    local args
+    args="$(jq -ac -n --arg query "$query" '{query: $query}')"
+
+    _gitnexus_call cypher "$args"
 }
 
 gitnexus-overview() {

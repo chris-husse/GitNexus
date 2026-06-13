@@ -37,12 +37,26 @@ import {
 import { resolveEmbeddingConfig } from './config.js';
 import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
+import { NODE_TABLES } from 'gitnexus-shared';
 import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
 import { getExactScanLimit } from '../platform/capabilities.js';
 import { logger } from '../logger.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+/**
+ * Allowlist of Cypher node labels. Cypher labels CANNOT be parameterized, so a
+ * label that is interpolated into a `MATCH (n:\`${label}\`)` position must be
+ * validated against this set first. Anything not present is rejected rather
+ * than interpolated (security round 3, R3): a label here is derived from a DB
+ * nodeId substring (`nodeId.substring(0, nodeId.indexOf(':'))`), which is
+ * attacker-influenceable if a malicious nodeId is ever stored.
+ */
+const VALID_NODE_LABELS: ReadonlySet<string> = new Set<string>(NODE_TABLES as readonly string[]);
+
+/** True only for labels that are safe to interpolate into a Cypher label position. */
+const isValidNodeLabel = (label: string): boolean => VALID_NODE_LABELS.has(label);
 
 const vectorUnavailableMessage =
   'VECTOR extension unavailable; semantic embeddings fall back to exact scan. ' +
@@ -115,6 +129,10 @@ const queryEmbeddableNodes = async (
   const allNodes: EmbeddableNode[] = [];
 
   for (const label of EMBEDDABLE_LABELS) {
+    // EMBEDDABLE_LABELS are compile-time-safe identifiers, but enforce the
+    // label-allowlist invariant uniformly so NO label position in this file is
+    // ever interpolated from an unvalidated value (security round 3, R3).
+    if (!isValidNodeLabel(label)) continue;
     try {
       let query: string;
 
@@ -588,6 +606,95 @@ export const runEmbeddingPipeline = async (
   }
 };
 
+/** A chunk grouped under a node label for batched metadata fetching. */
+type LabeledChunk = { nodeId: string; distance: number } & Record<string, any>;
+
+/**
+ * Optional prepared-statement executor. When supplied, the id list is bound as
+ * a query parameter (`WHERE n.id IN $ids`) instead of interpolated, so node ids
+ * never reach the Cypher text. `local-backend.ts` already binds ids this way;
+ * the unprepared `executeQuery (cypher) => rows` path used by the server/MCP
+ * callers cannot, so it falls back to the quote-escaped literal list below.
+ */
+export type ParameterizedExecutor = (cypher: string, params: Record<string, any>) => Promise<any[]>;
+
+/**
+ * Batch-fetch node metadata, one query per label group.
+ *
+ * SECURITY (round 3, R3): the `label` here is derived from a DB nodeId substring
+ * and is interpolated into a Cypher label position (`MATCH (n:\`${label}\`)`),
+ * which cannot be parameterized. Every group is therefore allowlist-validated
+ * against NODE_TABLES BEFORE the label is interpolated; an unknown label is
+ * skipped (treated as no rows) and never reaches a query. The `n.id IN [...]`
+ * value list is bound as `$ids` when a prepared executor is available, and
+ * otherwise uses the standard Cypher string-literal escape (`'` → `''`) — the
+ * value position is a string literal, so this is correct escaping, while the
+ * label allowlist is the load-bearing fix.
+ *
+ * Exported for direct unit testing with a mocked executor.
+ */
+export const fetchMetadataByLabel = async (
+  executeQuery: (cypher: string) => Promise<any[]>,
+  byLabel: Map<string, LabeledChunk[]>,
+  executeParameterized?: ParameterizedExecutor,
+): Promise<SemanticSearchResult[]> => {
+  const results: SemanticSearchResult[] = [];
+
+  for (const [label, items] of byLabel) {
+    // Cypher labels cannot be parameterized → reject anything not on the
+    // allowlist rather than interpolating an unvalidated label.
+    if (!isValidNodeLabel(label)) continue;
+
+    try {
+      const ids = items.map((i) => i.nodeId);
+      let nodeRows: any[];
+      if (executeParameterized) {
+        // Preferred: bind ids as a parameter; nothing user-derived is interpolated.
+        const nodeQuery = `
+          MATCH (n:\`${label}\`) WHERE n.id IN $ids
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine
+        `;
+        nodeRows = await executeParameterized(nodeQuery, { ids });
+      } else {
+        // Fallback (unprepared executor): the id value position is a Cypher
+        // string literal, so the standard `'` → `''` escape is correct.
+        const idList = ids.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
+        const nodeQuery = `
+          MATCH (n:\`${label}\`) WHERE n.id IN [${idList}]
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine
+        `;
+        nodeRows = await executeQuery(nodeQuery);
+      }
+
+      const rowMap = new Map<string, any>();
+      for (const row of nodeRows) {
+        const id = row.id ?? row[0];
+        rowMap.set(id, row);
+      }
+      for (const item of items) {
+        const nodeRow = rowMap.get(item.nodeId);
+        if (nodeRow) {
+          results.push({
+            nodeId: item.nodeId,
+            name: nodeRow.name ?? nodeRow[1] ?? '',
+            label,
+            filePath: nodeRow.filePath ?? nodeRow[2] ?? '',
+            distance: item.distance,
+            startLine: item.startLine,
+            endLine: item.endLine,
+          });
+        }
+      }
+    } catch {
+      // Table might not exist, skip
+    }
+  }
+
+  return results;
+};
+
 /**
  * Perform semantic search using the vector index with chunk deduplication
  */
@@ -596,6 +703,7 @@ export const semanticSearch = async (
   query: string,
   k: number = 10,
   maxDistance: number = 0.5,
+  executeParameterized?: ParameterizedExecutor,
 ): Promise<SemanticSearchResult[]> => {
   if (!isEmbedderReady()) {
     throw new Error('Embedding model not initialized. Run embedding pipeline first.');
@@ -680,10 +788,7 @@ export const semanticSearch = async (
   }
 
   // Group results by label for batched metadata queries
-  const byLabel = new Map<
-    string,
-    Array<{ nodeId: string; distance: number } & Record<string, any>>
-  >();
+  const byLabel = new Map<string, LabeledChunk[]>();
   for (const [nodeId, chunk] of Array.from(bestChunks.entries()).slice(0, k)) {
     const labelEndIdx = nodeId.indexOf(':');
     const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
@@ -691,41 +796,9 @@ export const semanticSearch = async (
     byLabel.get(label)!.push({ nodeId, ...chunk });
   }
 
-  // Batch-fetch metadata per label
-  const results: SemanticSearchResult[] = [];
-
-  for (const [label, items] of byLabel) {
-    const idList = items.map((i) => `'${i.nodeId.replace(/'/g, "''")}'`).join(', ');
-    try {
-      const nodeQuery = `
-        MATCH (n:\`${label}\`) WHERE n.id IN [${idList}]
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
-               n.startLine AS startLine, n.endLine AS endLine
-      `;
-      const nodeRows = await executeQuery(nodeQuery);
-      const rowMap = new Map<string, any>();
-      for (const row of nodeRows) {
-        const id = row.id ?? row[0];
-        rowMap.set(id, row);
-      }
-      for (const item of items) {
-        const nodeRow = rowMap.get(item.nodeId);
-        if (nodeRow) {
-          results.push({
-            nodeId: item.nodeId,
-            name: nodeRow.name ?? nodeRow[1] ?? '',
-            label,
-            filePath: nodeRow.filePath ?? nodeRow[2] ?? '',
-            distance: item.distance,
-            startLine: item.startLine,
-            endLine: item.endLine,
-          });
-        }
-      }
-    } catch {
-      // Table might not exist, skip
-    }
-  }
+  // Batch-fetch metadata per label. The label is allowlist-validated and the id
+  // list is bound/escaped inside fetchMetadataByLabel (security round 3, R3).
+  const results = await fetchMetadataByLabel(executeQuery, byLabel, executeParameterized);
 
   results.sort((a, b) => a.distance - b.distance);
 
