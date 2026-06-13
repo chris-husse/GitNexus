@@ -63,8 +63,18 @@ if [ "$found" = false ]; then
 fi
 
 # Run gitnexus augment — must be fast (<500ms target)
-# augment writes to stderr (KuzuDB captures stdout at OS level), so capture stderr and discard stdout
-RESULT=$(cd "$CWD" && npx -y gitnexus augment "$PATTERN" 2>&1 1>/dev/null)
+# augment writes to stderr (KuzuDB captures stdout at OS level), so capture stderr and discard stdout.
+#
+# Use an already-installed `gitnexus` only; do NOT silently install one. The
+# previous `npx -y gitnexus` would download and run an arbitrary version of the
+# package on every search in an indexed repo — a supply-chain risk and a silent
+# install. If no `gitnexus` is on PATH, skip augmentation entirely (exit 0); the
+# search proceeds without graph enrichment. ("$PATTERN" is already a single safe
+# quoted argv, so there is no shell-injection change here.)
+if ! command -v gitnexus >/dev/null 2>&1; then
+  exit 0
+fi
+RESULT=$(cd "$CWD" && gitnexus augment "$PATTERN" 2>&1 1>/dev/null)
 
 if [ -n "$RESULT" ]; then
   ESCAPED=$(echo "$RESULT" | jq -Rs .)

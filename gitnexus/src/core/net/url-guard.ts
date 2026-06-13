@@ -1,4 +1,5 @@
 import { isIP } from 'net';
+import dns from 'dns/promises';
 
 // Cloud metadata hostnames that must never be reachable via user-supplied URLs
 const BLOCKED_HOSTNAMES = new Set([
@@ -77,6 +78,66 @@ export function validateGitUrl(url: string): void {
     /^198\.1[89]\./.test(host)
   ) {
     throw new Error('Cloning from private/internal addresses is not allowed');
+  }
+}
+
+/**
+ * `validateGitUrl` plus a DNS-rebinding defense for hostnames (D1).
+ *
+ * The static checks above can only vet the hostname text: a public-looking
+ * domain can still resolve to a private/internal IP. For non-IP hosts this
+ * resolves the name and runs the same private-range assertions on EVERY
+ * returned address, rejecting the URL if any is blocked. Async because of the
+ * lookup, which is why it is a separate entry point — `validateGitUrl` stays
+ * synchronous for callers that only need the static checks.
+ *
+ * Residual TOCTOU: `git` re-resolves the hostname when it opens its own
+ * connection, so an attacker controlling the authoritative DNS could return a
+ * public IP here and a private IP to git moments later. Fully closing that
+ * would require pinning the resolved IP into git's connection, which is
+ * fragile across transports and out of scope. This closes the static
+ * "domain → private IP" case and shrinks the rebinding window.
+ */
+export async function validateGitUrlResolved(url: string): Promise<void> {
+  validateGitUrl(url);
+
+  const host = new URL(url).hostname.toLowerCase();
+  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  // Literal IP hosts were vetted statically above; only names need resolving.
+  if (isIP(bare) !== 0 || bare.includes(':')) return;
+
+  await assertResolvedAddressesArePublic(host);
+}
+
+/**
+ * Resolve `host` and assert every resolved address is public (D1).
+ *
+ * Uses `dns.promises.lookup(host, { all: true })`, which honors the OS resolver
+ * (hosts file, search domains) the way git will when it connects — so the set
+ * we vet matches what git is most likely to use.
+ *
+ * A lookup failure (NXDOMAIN, no records, resolver error) is a hard failure: if
+ * we cannot prove the destination is public we refuse to clone rather than
+ * fall through to git with an unverified host.
+ */
+async function assertResolvedAddressesArePublic(host: string): Promise<void> {
+  let addresses: Array<{ address: string; family: number }>;
+  try {
+    addresses = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('Could not resolve git host');
+  }
+
+  if (addresses.length === 0) {
+    throw new Error('Could not resolve git host');
+  }
+
+  for (const { address, family } of addresses) {
+    if (family === 6 || address.includes(':')) {
+      assertNotPrivateIPv6(address.toLowerCase());
+    } else {
+      assertNotPrivateIPv4(address);
+    }
   }
 }
 
