@@ -205,6 +205,39 @@ function extractPattern(toolName, toolInput) {
 let unguardedCliWarned = false;
 
 /**
+ * Validate a candidate GITNEXUS_HOOK_CLI_PATH value (#R12 defense-in-depth).
+ *
+ * GITNEXUS_HOOK_CLI_PATH is a TRUSTED, OPERATOR-ONLY override: when set, its
+ * value is handed straight to `spawnSync(process.execPath, [hookCli, ...])`
+ * (or the coreutils-timeout guard wrapping it), so it directly chooses which
+ * script Node executes. It is never derived from repository content, tool
+ * input, or any other untrusted source — only from the host environment an
+ * operator controls. The threat model here is therefore weak, but we still
+ * constrain the accepted shape as belt-and-suspenders hardening: require an
+ * already-absolute, already-normalized path. Rejecting relative paths removes
+ * any dependence on the (caller-supplied) cwd for resolution, and rejecting
+ * un-normalized paths refuses values that smuggle `..` traversal or redundant
+ * separators that `path.normalize` would otherwise collapse. A value that
+ * fails this check is ignored (the caller falls through to PATH/`which`/npx
+ * resolution); we never throw, so a malformed override degrades to the normal
+ * resolution path rather than disabling the augment.
+ *
+ * NOTE: this does NOT make an untrusted value safe — it only narrows a trusted
+ * value to a predictable, unambiguous form. The existence check stays in the
+ * caller alongside this guard.
+ */
+function isTrustedHookCliPath(value) {
+  if (value === undefined || value === null) return false;
+  const p = String(value);
+  if (!p.trim()) return false;
+  // Require an absolute, already-normalized path: reject relative paths and any
+  // value `path.normalize` would rewrite (e.g. `..` traversal, `.` segments,
+  // or doubled separators). `path.normalize(p) === p` holds only when the
+  // input is already in canonical form.
+  return path.isAbsolute(p) && path.normalize(p) === p;
+}
+
+/**
  * Spawn a gitnexus CLI command synchronously.
  * Detects binary on PATH once, then runs exactly once.
  *
@@ -268,7 +301,11 @@ function runGitNexusCli(args, cwd, timeout) {
     );
   }
   const hookCli = process.env.GITNEXUS_HOOK_CLI_PATH;
-  if (hookCli !== undefined && String(hookCli).trim() && fs.existsSync(String(hookCli))) {
+  // Accept the operator override only when it is an absolute, normalized path
+  // (isTrustedHookCliPath) AND points at an existing file. An out-of-shape or
+  // missing value is silently ignored — control falls through to the
+  // PATH/`which`/npx resolution below (we never throw on a bad override).
+  if (isTrustedHookCliPath(hookCli) && fs.existsSync(String(hookCli))) {
     const [cmd, cmdArgs] = guard
       ? [
           guard,
@@ -499,4 +536,19 @@ function main() {
   }
 }
 
-main();
+// Export the testable units so the plugin test suite can exercise them in
+// isolation (mirrors the require.main === module convention used by the
+// sibling hook modules: hook-lock.js, hook-db-lock-probe.cjs,
+// resolve-analyze-cmd.cjs). main() reads stdin, so it must stay gated behind
+// the entrypoint check below — running it on require() would block the test
+// process on fd 0.
+module.exports = {
+  isTrustedHookCliPath,
+  runGitNexusCli,
+};
+
+// Run as a hook only when invoked directly (`node gitnexus-hook.js`), never on
+// require() from a test.
+if (require.main === module) {
+  main();
+}
