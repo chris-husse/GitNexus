@@ -29,6 +29,7 @@ import {
 } from './graph-queries.js';
 import { generateHTMLViewer } from './html-viewer.js';
 import { sanitizeMermaidMarkdown } from './mermaid-sanitizer.js';
+import { fenceUntrustedFile, UNTRUSTED_FILE_CLOSE } from './untrusted.js';
 
 import {
   callLLM,
@@ -1163,24 +1164,37 @@ export class WikiGenerator {
   }
 
   private async readSourceFiles(filePaths: string[]): Promise<string> {
+    // Each file's content is fed verbatim into an LLM prompt. The repository is
+    // untrusted, so fence every file in an <untrusted_file> block and defang any
+    // embedded closing token — a file body (or path) cannot break out of its
+    // fence and pose as instructions (A1 — prompt-injection hardening).
     const parts: string[] = [];
     for (const fp of filePaths) {
       const fullPath = path.join(this.repoPath, fp);
       try {
         const content = await fs.readFile(fullPath, 'utf-8');
-        parts.push(`\n--- ${fp} ---\n${content}`);
+        parts.push(fenceUntrustedFile(fp, content));
       } catch {
-        parts.push(`\n--- ${fp} ---\n(file not readable)`);
+        parts.push(fenceUntrustedFile(fp, '(file not readable)'));
       }
     }
-    return parts.join('\n');
+    return parts.join('\n\n');
   }
 
   private truncateSource(source: string, maxTokens: number): string {
     // Rough truncation: keep first maxTokens*4 chars and add notice
     const maxChars = maxTokens * 4;
     if (source.length <= maxChars) return source;
-    return source.slice(0, maxChars) + '\n\n... (source truncated for context window limits)';
+    let truncated = source.slice(0, maxChars);
+    // Truncation can cut through the middle of an <untrusted_file> fence, leaving
+    // a dangling open tag with no matching close. Re-terminate it so the
+    // instruction boundary stays well-formed (A1). Counting structural tags is
+    // safe because any closing token inside file content was already defanged in
+    // readSourceFiles, so it never matches `</untrusted_file>`.
+    const opens = (truncated.match(/<untrusted_file\b/g) ?? []).length;
+    const closes = (truncated.match(/<\/untrusted_file>/g) ?? []).length;
+    if (opens > closes) truncated += `\n${UNTRUSTED_FILE_CLOSE}`;
+    return truncated + '\n\n... (source truncated for context window limits)';
   }
 
   private async estimateModuleTokens(filePaths: string[]): Promise<number> {
