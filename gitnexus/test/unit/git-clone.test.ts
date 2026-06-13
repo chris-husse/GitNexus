@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, it, expect, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, it, expect, vi } from 'vitest';
 
 // The logger is a Proxy with no `set` trap, so vi.spyOn can't patch it.
 // Mock the module and expose `warn` as a countable spy (other levels no-op).
@@ -14,12 +14,23 @@ vi.mock('../../src/core/logger.js', () => ({
   },
 }));
 
+// Mock the DNS resolver used by validateGitUrlResolved's rebinding defense (D1).
+// The default resolves every host to a public IP so the hostname-based clone
+// tests stay hermetic (no real network); the rebinding tests override it.
+const dnsLookupMock = vi.fn(async () => [{ address: '140.82.121.4', family: 4 }]);
+// url-guard.ts imports `dns from 'dns/promises'`; mock that exact specifier.
+vi.mock('dns/promises', () => ({
+  default: { lookup: (...args: unknown[]) => (dnsLookupMock as any)(...args) },
+  lookup: (...args: unknown[]) => (dnsLookupMock as any)(...args),
+}));
+
 import {
   analyzeCloneOptions,
   extractRepoName,
   extractWebRepoName,
   getCloneDir,
   validateGitUrl,
+  validateGitUrlResolved,
   cloneOrPull,
   buildCloneArgs,
   buildBranchCloneArgs,
@@ -352,6 +363,100 @@ describe('git-clone', () => {
 
     it('blocks 0.0.0.0', () => {
       expect(() => validateGitUrl('http://0.0.0.0/repo.git')).toThrow('private/internal');
+    });
+  });
+
+  // ── DNS-rebinding defense (D1) ──────────────────────────────────────
+  describe('validateGitUrlResolved — DNS rebinding (resolved-address checks)', () => {
+    afterEach(() => {
+      // Restore the default public-IP resolver for the next test.
+      dnsLookupMock.mockReset();
+      dnsLookupMock.mockResolvedValue([{ address: '140.82.121.4', family: 4 }]);
+    });
+
+    it('rejects a public-looking hostname that resolves to a private IPv4', async () => {
+      dnsLookupMock.mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }]);
+      await expect(
+        validateGitUrlResolved('https://rebind.attacker.example/repo.git'),
+      ).rejects.toThrow('private/internal');
+    });
+
+    it('rejects a hostname that resolves to loopback (127.0.0.1)', async () => {
+      dnsLookupMock.mockResolvedValueOnce([{ address: '127.0.0.1', family: 4 }]);
+      await expect(
+        validateGitUrlResolved('https://localhost-alias.example/repo.git'),
+      ).rejects.toThrow('private/internal');
+    });
+
+    it('rejects a hostname that resolves to the cloud metadata IP (169.254.169.254)', async () => {
+      dnsLookupMock.mockResolvedValueOnce([{ address: '169.254.169.254', family: 4 }]);
+      await expect(
+        validateGitUrlResolved('https://metadata-alias.example/repo.git'),
+      ).rejects.toThrow('private/internal');
+    });
+
+    it('rejects a hostname that resolves to a private IPv6 (ULA)', async () => {
+      dnsLookupMock.mockResolvedValueOnce([{ address: 'fd00::1', family: 6 }]);
+      await expect(validateGitUrlResolved('https://v6-rebind.example/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+    });
+
+    it('rejects when ANY of multiple resolved addresses is private', async () => {
+      // A public A record plus a private one — git could connect to either, so
+      // the presence of a single private address must reject the whole URL.
+      dnsLookupMock.mockResolvedValueOnce([
+        { address: '140.82.121.4', family: 4 },
+        { address: '192.168.1.10', family: 4 },
+      ]);
+      await expect(
+        validateGitUrlResolved('https://mixed.attacker.example/repo.git'),
+      ).rejects.toThrow('private/internal');
+    });
+
+    it('passes a hostname that resolves only to public addresses', async () => {
+      dnsLookupMock.mockResolvedValueOnce([
+        { address: '140.82.121.4', family: 4 },
+        { address: '2606:4700:4700::1111', family: 6 },
+      ]);
+      await expect(
+        validateGitUrlResolved('https://legit.example/repo.git'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('rejects when the host cannot be resolved (fail closed)', async () => {
+      dnsLookupMock.mockRejectedValueOnce(new Error('ENOTFOUND'));
+      await expect(validateGitUrlResolved('https://nonexistent.example/repo.git')).rejects.toThrow(
+        'Could not resolve git host',
+      );
+    });
+
+    it('rejects when the host resolves to no addresses (fail closed)', async () => {
+      dnsLookupMock.mockResolvedValueOnce([]);
+      await expect(validateGitUrlResolved('https://empty.example/repo.git')).rejects.toThrow(
+        'Could not resolve git host',
+      );
+    });
+
+    it('still applies every static check before resolving', async () => {
+      await expect(validateGitUrlResolved('ssh://git@github.com/o/r.git')).rejects.toThrow(
+        'Only https:// and http://',
+      );
+      await expect(validateGitUrlResolved('https://localhost/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      expect(dnsLookupMock).not.toHaveBeenCalled();
+    });
+
+    it('does NOT perform a DNS lookup for literal-IP hosts (handled statically)', async () => {
+      dnsLookupMock.mockClear();
+      await expect(
+        validateGitUrlResolved('https://140.82.121.4/repo.git'),
+      ).resolves.toBeUndefined();
+      await expect(validateGitUrlResolved('http://10.0.0.1/repo.git')).rejects.toThrow(
+        'private/internal',
+      );
+      expect(dnsLookupMock).not.toHaveBeenCalled();
     });
   });
 

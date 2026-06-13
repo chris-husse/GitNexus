@@ -13,7 +13,7 @@ import { logger } from '../core/logger.js';
 import { getGlobalDir } from '../storage/repo-manager.js';
 import { branchSlug } from '../storage/branch-index.js';
 import { sanitizeRepoName, stripUrlCredentials } from '../storage/git.js';
-import { validateGitUrl } from '../core/net/url-guard.js';
+import { validateGitUrl, validateGitUrlResolved } from '../core/net/url-guard.js';
 import {
   assertDirectoryOwnerAndPermissions,
   quarantineAutoSyncPartial,
@@ -24,7 +24,7 @@ import {
   validateAutoSyncRemoteUrl,
 } from '../core/auto-sync/config.js';
 
-export { validateGitUrl };
+export { validateGitUrl, validateGitUrlResolved };
 
 /**
  * Root directory for all cloned repositories. Targets must resolve inside this.
@@ -574,7 +574,9 @@ export async function cloneOrPull(
   // the code path where the repo was cloned. Now it runs unconditionally,
   // preventing SSRF / blocked-host bypasses even when targetDir already exists.
   if (options?.allowAutoSyncSsh) validateAutoSyncRemoteUrl(url, options.autoSyncAllowedHosts);
-  else validateGitUrl(url);
+  // Non-auto-sync URLs also get the DNS-rebinding check (D1): the static
+  // host checks cannot see what a public-looking name resolves to.
+  else await validateGitUrlResolved(url);
   // Fetch uses remote.origin.url, so the absolute name has to be what is
   // stored, not only the clone argv. Non-auto-sync clones keep the given URL.
   const dialUrl = options?.allowAutoSyncSsh ? absoluteAutoSyncRemoteUrl(url) : url;
