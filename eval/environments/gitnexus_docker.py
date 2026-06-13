@@ -32,7 +32,12 @@ from constants import (
     EVAL_SERVER_HEALTH_TIMEOUT_SECONDS,
 )
 from minisweagent.environments.docker import DockerEnvironment
-from tool_registry import TOOL_SPECS, ToolScriptSpec
+from tool_registry import (
+    JSON_PAYLOAD_FN,
+    PAYLOAD_HELPER_TOKEN,
+    TOOL_SPECS,
+    ToolScriptSpec,
+)
 from utils.errors import is_debug_enabled, log_safe_exception
 
 logger = logging.getLogger("gitnexus_docker")
@@ -228,7 +233,14 @@ class GitNexusDockerEnvironment(DockerEnvironment):
             lines.append(spec.header.strip())
 
         if spec.payload_builder:
-            lines.append(spec.payload_builder.strip())
+            payload_builder = spec.payload_builder.strip()
+            # Scripts that build their JSON body via the python3 helper need its
+            # definition in scope. The helper escapes argument values with
+            # json.dumps so a value containing ", \ or a newline cannot break
+            # out of the JSON (it is passed as argv data, never interpolated).
+            if PAYLOAD_HELPER_TOKEN in payload_builder:
+                lines.append(JSON_PAYLOAD_FN)
+            lines.append(payload_builder)
 
         if spec.endpoint:
             lines.append(
