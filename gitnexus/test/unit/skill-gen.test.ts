@@ -947,3 +947,173 @@ describe('generateSkillFiles — file output', () => {
     expect(keyFilesSection).toContain('src/win/f0.ts');
   });
 });
+
+// ============================================================================
+// TESTS — R4 MARKDOWN/YAML INJECTION HARDENING
+// ============================================================================
+
+describe('generateSkillFiles — R4 untrusted-symbol escaping', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-skill-r4-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+
+  /** Count YAML frontmatter top-level keys in the leading `---` block. */
+  function frontmatterKeys(content: string): string[] {
+    expect(content.startsWith('---\n')).toBe(true);
+    const end = content.indexOf('\n---', 4);
+    const fm = content.slice(4, end);
+    return fm
+      .split('\n')
+      .map((l) => l.match(/^([A-Za-z0-9_-]+):/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) => m[1]);
+  }
+
+  it('an adversarial cluster label cannot inject a frontmatter key or extra heading', async () => {
+    const graph = createKnowledgeGraph();
+    for (let i = 0; i < 4; i++) {
+      graph.addNode(
+        makeNode(`fn:e${i}`, `evilFn${i}`, 'Function', `${tmpDir}/src/evil/f${i}.ts`, 1, true),
+      );
+    }
+    // Label tries to: close the description scalar, add a YAML key, and inject a
+    // top-level Markdown heading.
+    const evilLabel = 'Pwn"\ninjected_key: attacker\n# Injected Heading\nmalicious: true';
+    const communities = [makeCommunity('c1', evilLabel, 4)];
+    const memberships = [0, 1, 2, 3].map((i) => makeMembership(`fn:e${i}`, 'c1'));
+
+    const result = await generateSkillFiles(
+      tmpDir,
+      'Proj',
+      buildPipelineResult({ graph, repoPath: tmpDir, communities, memberships }),
+    );
+    expect(result.skills).toHaveLength(1);
+
+    const content = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', result.skills[0].name, 'SKILL.md'),
+      'utf-8',
+    );
+
+    // Only the two legitimate frontmatter keys exist — no injected key.
+    expect(frontmatterKeys(content).sort()).toEqual(['description', 'name']);
+    // The injected heading text is neutralized (collapsed onto the title line),
+    // so it does not appear as its own `# Injected Heading` line.
+    expect(content.split('\n')).not.toContain('# Injected Heading');
+    expect(content).not.toContain('\ninjected_key: attacker');
+  });
+
+  it('a symbol name containing a pipe cannot inject a Key Symbols table column', async () => {
+    const graph = createKnowledgeGraph();
+    // A symbol name with a pipe + newline would, unescaped, add a column and a row.
+    graph.addNode(
+      makeNode(
+        'fn:p',
+        'evil | Type | x.ts | 999\n| InjectedRow | Y | z.ts | 1',
+        'Function',
+        `${tmpDir}/src/p/a.ts`,
+        1,
+        true,
+      ),
+    );
+    for (let i = 0; i < 3; i++) {
+      graph.addNode(
+        makeNode(`fn:n${i}`, `n${i}`, 'Function', `${tmpDir}/src/p/b${i}.ts`, 1, false),
+      );
+    }
+    const communities = [makeCommunity('c1', 'Piped', 4)];
+    const memberships = ['fn:p', 'fn:n0', 'fn:n1', 'fn:n2'].map((id) => makeMembership(id, 'c1'));
+
+    await generateSkillFiles(
+      tmpDir,
+      'Proj',
+      buildPipelineResult({ graph, repoPath: tmpDir, communities, memberships }),
+    );
+
+    const content = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', 'piped', 'SKILL.md'),
+      'utf-8',
+    );
+
+    // No injected table row appears on its own line.
+    expect(content.split('\n')).not.toContain('| InjectedRow | Y | z.ts | 1');
+    // Every Key Symbols data row has exactly 4 columns (5 pipes), proving no
+    // unescaped pipe split a cell into extra columns.
+    const symbolsSection = content.slice(content.indexOf('## Key Symbols'));
+    const dataRows = symbolsSection
+      .split('\n')
+      .filter((l) => l.startsWith('| `'))
+      .filter((l) => !l.includes('---'));
+    expect(dataRows.length).toBeGreaterThan(0);
+    for (const row of dataRows) {
+      const unescapedPipes = (row.match(/(?<!\\)\|/g) || []).length;
+      expect(unescapedPipes).toBe(5);
+    }
+  });
+
+  it('a symbol name with a backtick cannot escape the inline-code span in How to Explore', async () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode(
+      makeNode('fn:b', 'name`); DROP TABLE x; ({', 'Function', `${tmpDir}/src/b/a.ts`, 1, true),
+    );
+    for (let i = 0; i < 3; i++) {
+      graph.addNode(
+        makeNode(`fn:n${i}`, `n${i}`, 'Function', `${tmpDir}/src/b/c${i}.ts`, 1, false),
+      );
+    }
+    const communities = [makeCommunity('c1', 'Backtick', 4)];
+    const memberships = ['fn:b', 'fn:n0', 'fn:n1', 'fn:n2'].map((id) => makeMembership(id, 'c1'));
+
+    await generateSkillFiles(
+      tmpDir,
+      'Proj',
+      buildPipelineResult({ graph, repoPath: tmpDir, communities, memberships }),
+    );
+
+    const content = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', 'backtick', 'SKILL.md'),
+      'utf-8',
+    );
+    // The How-to-Explore line embeds firstEntry in a backtick code span; a raw
+    // backtick in the name would close it. After escaping the line has balanced
+    // backticks.
+    const exploreLine = content.split('\n').find((l) => l.includes('context({name:'))!;
+    expect(exploreLine).toBeDefined();
+    expect((exploreLine.match(/`/g) || []).length % 2).toBe(0);
+  });
+
+  it('includes the auto-generated-from-untrusted-symbols provenance note', async () => {
+    const graph = createKnowledgeGraph();
+    for (let i = 0; i < 4; i++) {
+      graph.addNode(
+        makeNode(`fn:n${i}`, `n${i}`, 'Function', `${tmpDir}/src/n/f${i}.ts`, 1, false),
+      );
+    }
+    const communities = [makeCommunity('c1', 'Noted', 4)];
+    const memberships = [0, 1, 2, 3].map((i) => makeMembership(`fn:n${i}`, 'c1'));
+
+    await generateSkillFiles(
+      tmpDir,
+      'Proj',
+      buildPipelineResult({ graph, repoPath: tmpDir, communities, memberships }),
+    );
+
+    const content = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', 'noted', 'SKILL.md'),
+      'utf-8',
+    );
+    expect(content.toLowerCase()).toContain('auto-generated');
+    expect(content.toLowerCase()).toContain('untrusted');
+  });
+});

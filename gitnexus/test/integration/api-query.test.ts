@@ -79,6 +79,64 @@ withTestLbugDB(
         expect(body.error).toContain('"params"');
       });
 
+      // R2-server: scalar params accepted, and an array-of-scalars param binds
+      // for `WHERE x IN $ids` (round-trips web → server → executePrepared).
+      it('accepts scalar params and binds them', async () => {
+        const response = await fetch(`${baseUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cypher: 'RETURN $n AS n', params: { n: 7 } }),
+        });
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        expect(body.result[0].n).toBe(7);
+      });
+
+      it('accepts an array-of-scalars param for IN $ids', async () => {
+        const response = await fetch(`${baseUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cypher: 'UNWIND $ids AS id RETURN id',
+            params: { ids: ['a', 'b', 'c'] },
+          }),
+        });
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        // The array-of-scalars param binds and UNWINDs to one row per element,
+        // proving array params round-trip web → server → executePrepared (the
+        // pattern the web tools' `WHERE x IN $ids` lists rely on).
+        expect(body.result.map((r: { id: string }) => r.id)).toEqual(['a', 'b', 'c']);
+      });
+
+      it('rejects a params payload with a nested object value', async () => {
+        const response = await fetch(`${baseUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cypher: 'RETURN 1 AS one',
+            params: { bad: { nested: 1 } },
+          }),
+        });
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.error).toContain('"params"');
+      });
+
+      it('rejects a params payload with an array of objects', async () => {
+        const response = await fetch(`${baseUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cypher: 'RETURN 1 AS one',
+            params: { bad: [{ a: 1 }] },
+          }),
+        });
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.error).toContain('"params"');
+      });
+
       it('returns 400 when cypher is missing', async () => {
         const response = await fetch(`${baseUrl}/api/query`, {
           method: 'POST',
