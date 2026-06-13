@@ -218,7 +218,7 @@ const JS_APP = `
   var activePage = 'overview';
 
   document.addEventListener('DOMContentLoaded', function() {
-    mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });
+    mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' });
     renderMeta();
     renderNav();
     document.getElementById('menu-toggle').addEventListener('click', function() {
