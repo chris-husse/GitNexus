@@ -1,15 +1,22 @@
 /**
- * Tests for gitnexus-hook.js — GITNEXUS_HOOK_CLI_PATH override hardening (R12).
+ * Tests for gitnexus-hook.js — GITNEXUS_HOOK_CLI_PATH override hardening (R12)
+ * and removal of the `npx -y gitnexus` silent-install fallback (R4).
  *
  * Runner: Node's built-in `node:test` (the plugin ships no test framework and
  * the hooks run under a bare `node`, so we stay zero-dependency). Run with:
  *   node --test gitnexus-claude-plugin/hooks/gitnexus-hook.test.js
  *
- * These tests pin the defense-in-depth contract for the operator-only
+ * R12 tests pin the defense-in-depth contract for the operator-only
  * GITNEXUS_HOOK_CLI_PATH override: an absolute, normalized path that exists is
  * still executed (behavior unchanged), while a relative path or one containing
- * `..` traversal is ignored — control falls through to PATH/`which`/npx
- * resolution and the override script is NEVER spawned.
+ * `..` traversal is ignored — control falls through to PATH/`which` resolution
+ * and the override script is NEVER spawned.
+ *
+ * R4 tests pin the no-auto-install contract: when neither a trusted
+ * GITNEXUS_HOOK_CLI_PATH nor a `gitnexus` on PATH is available, runGitNexusCli
+ * NEVER shells out to `npx` (no unpinned download/execute) and returns a
+ * synthetic spawnSync-shaped skip result that the caller treats as "no
+ * augmentation".
  */
 
 const test = require('node:test');
@@ -112,8 +119,9 @@ test('runGitNexusCli ignores a relative GITNEXUS_HOOK_CLI_PATH (override not exe
     const child = withEnv(
       {
         GITNEXUS_HOOK_CLI_PATH: 'cli-stub.js',
-        // Strip PATH so the fall-through which/where + npx both ENOENT fast and
-        // offline — we never want the npx fallback to actually run gitnexus.
+        // Strip PATH so the fall-through which/where finds no installed
+        // `gitnexus` — control reaches the no-op skip (#R4) rather than the
+        // (now-removed) npx fallback.
         PATH: '',
         Path: '',
         GITNEXUS_HOOK_TIMEOUT_PATH: 'disabled',
@@ -125,10 +133,11 @@ test('runGitNexusCli ignores a relative GITNEXUS_HOOK_CLI_PATH (override not exe
       new RegExp(SENTINEL),
       'relative override must NOT be executed',
     );
-    // It fell through to PATH/which/npx resolution, which cannot resolve with
-    // an empty PATH — so the spawn errors out (no augment) rather than running
-    // the override.
-    assert.ok(child.error, 'expected fall-through spawn to fail with stripped PATH');
+    // It fell through to PATH/which resolution, which finds nothing with an
+    // empty PATH — so runGitNexusCli returns the synthetic skip result (no
+    // augment) rather than running the override or installing via npx.
+    assert.ok(child.error, 'expected the no-CLI skip result (truthy error)');
+    assert.strictEqual(child.status, null, 'skip result carries a null status');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -167,7 +176,46 @@ test('runGitNexusCli ignores a GITNEXUS_HOOK_CLI_PATH containing .. traversal (o
       new RegExp(SENTINEL),
       '.. traversal override must NOT be executed',
     );
-    assert.ok(child.error, 'expected fall-through spawn to fail with stripped PATH');
+    assert.ok(child.error, 'expected the no-CLI skip result (truthy error)');
+    assert.strictEqual(child.status, null, 'skip result carries a null status');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runGitNexusCli no-ops (no npx) when no override and `gitnexus` is not on PATH (#R4)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-hook-skip-'));
+  try {
+    const child = withEnv(
+      {
+        // No operator override at all.
+        GITNEXUS_HOOK_CLI_PATH: undefined,
+        // Strip PATH so neither which/where nor any npx could resolve a binary.
+        // The old code would shell out to `npx -y gitnexus` here; the new code
+        // must instead return a skip result without spawning anything.
+        PATH: '',
+        Path: '',
+        GITNEXUS_HOOK_TIMEOUT_PATH: 'disabled',
+      },
+      () => runGitNexusCli(['augment', '--', 'needle'], dir, 7000),
+    );
+    // The synthetic skip result is shaped like spawnSync's return value so the
+    // caller's `!child.error && child.status === 0` guard treats it as "no
+    // augmentation" — never `status === 0`, so augmentation is skipped.
+    assert.ok(child.error instanceof Error, 'skip result must carry an Error');
+    assert.match(
+      child.error.message,
+      /not found.*skip/i,
+      'skip error message describes the missing-CLI no-op',
+    );
+    assert.strictEqual(child.status, null, 'skip result status is null (not a success exit)');
+    assert.strictEqual(child.stdout, '', 'skip result has empty stdout');
+    assert.strictEqual(child.stderr, '', 'skip result has empty stderr');
+    // The caller gate: this must NOT satisfy the "augment succeeded" condition.
+    assert.ok(
+      !(!child.error && child.status === 0),
+      'skip result must fail the caller augment gate',
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
