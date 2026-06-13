@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { AppStateProvider, useAppState } from '../../src/hooks/useAppState';
-import { getActiveProviderConfig } from '../../src/core/llm/settings-service';
+import { getProviderConfigFromSettings } from '../../src/core/llm/settings-service';
 import type { CodebaseContext } from '../../src/core/llm/context-builder';
 
 // initializeAgent's heavy dynamic imports are stubbed — these tests only lock
@@ -29,7 +29,7 @@ vi.mock('../../src/core/llm/agent', () => ({
 
 vi.mock('../../src/core/llm/settings-service', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/llm/settings-service')>();
-  return { ...actual, getActiveProviderConfig: vi.fn(actual.getActiveProviderConfig) };
+  return { ...actual, getProviderConfigFromSettings: vi.fn(actual.getProviderConfigFromSettings) };
 });
 
 afterEach(() => {
@@ -37,7 +37,7 @@ afterEach(() => {
 });
 
 const withProvider = () => {
-  vi.mocked(getActiveProviderConfig).mockReturnValue({
+  vi.mocked(getProviderConfigFromSettings).mockReturnValue({
     provider: 'openai',
     model: 'gpt-4o',
     apiKey: 'test-key',
