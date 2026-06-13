@@ -108,14 +108,17 @@ export const ProcessesPanel = () => {
       const allEdges: Array<{ from: string; to: string; type: string }> = [];
 
       // Fetch steps for all processes concurrently in batches if needed, but for now sequentially to be safe
-      // Optimization: Fetch all steps in one query if possible
+      // Optimization: Fetch all steps in one query if possible.
+      // Process ids are graph-derived (untrusted) — bind them as a $ids array
+      // param instead of interpolating into the Cypher string (R2). LadybugDB
+      // binds `IN $ids` against an array. isSafeId stays as defense-in-depth.
       const allStepsQuery = `
                 MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-                WHERE p.id IN [${allProcessIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')}]
+                WHERE p.id IN $ids
                 RETURN s.id AS id, s.name AS name, s.filePath AS filePath, r.step AS stepNumber
             `;
 
-      const stepsResult = await runQuery(allStepsQuery);
+      const stepsResult = await runQuery(allStepsQuery, { ids: allProcessIds });
 
       for (const row of stepsResult) {
         const stepId = row.id || row[0];
@@ -132,18 +135,19 @@ export const ProcessesPanel = () => {
       const allSteps = Array.from(allStepsMap.values());
       const stepIds = allSteps.map((s) => s.id).filter(isSafeId);
 
-      // Query for all CALLS edges between the combined steps
+      // Query for all CALLS edges between the combined steps. Step ids are
+      // graph-derived (untrusted) — bound as a $ids array param, never
+      // interpolated (R2). isSafeId stays as defense-in-depth.
       if (stepIds.length > 0) {
-        // Batch query if too many steps
         const edgesQuery = `
                     MATCH (from)-[r:CodeRelation {type: 'CALLS'}]->(to)
-                    WHERE from.id IN [${stepIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')}]
-                      AND to.id IN [${stepIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')}]
+                    WHERE from.id IN $ids
+                      AND to.id IN $ids
                     RETURN from.id AS fromId, to.id AS toId, r.type AS type
                 `;
 
         try {
-          const edgesResult = await runQuery(edgesQuery);
+          const edgesResult = await runQuery(edgesQuery, { ids: stepIds });
           allEdges.push(
             ...edgesResult
               .map((row: any) => ({
@@ -182,14 +186,16 @@ export const ProcessesPanel = () => {
       setLoadingProcess(processId);
 
       try {
-        // Query for process steps
+        // Query for process steps. processId is graph-derived (untrusted) —
+        // bound as a $pid param, never interpolated (R2). isSafeId above stays
+        // as defense-in-depth.
         const stepsQuery = `
-        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${processId.replace(/'/g, "''")}'})
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $pid})
         RETURN s.id AS id, s.name AS name, s.filePath AS filePath, r.step AS stepNumber
         ORDER BY r.step
       `;
 
-        const stepsResult = await runQuery(stepsQuery);
+        const stepsResult = await runQuery(stepsQuery, { pid: processId });
 
         const steps: ProcessStep[] = stepsResult.map((row: any) => ({
           id: row.id || row[0],
@@ -201,18 +207,19 @@ export const ProcessesPanel = () => {
         // Get step IDs for edge query
         const stepIds = steps.map((s) => s.id).filter(isSafeId);
 
-        // Query for CALLS edges between the steps in this process
+        // Query for CALLS edges between the steps in this process. Step ids are
+        // graph-derived (untrusted) — bound as a $ids array param (R2).
         let edges: Array<{ from: string; to: string; type: string }> = [];
         if (stepIds.length > 0) {
           const edgesQuery = `
           MATCH (from)-[r:CodeRelation {type: 'CALLS'}]->(to)
-          WHERE from.id IN [${stepIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')}]
-            AND to.id IN [${stepIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')}]
+          WHERE from.id IN $ids
+            AND to.id IN $ids
           RETURN from.id AS fromId, to.id AS toId, r.type AS type
         `;
 
           try {
-            const edgesResult = await runQuery(edgesQuery);
+            const edgesResult = await runQuery(edgesQuery, { ids: stepIds });
             edges = edgesResult
               .map((row: any) => ({
                 from: row.fromId || row[0],
@@ -271,14 +278,16 @@ export const ProcessesPanel = () => {
         return;
       }
 
-      // Load steps for this process
+      // Load steps for this process. processId is graph-derived (untrusted) —
+      // bound as a $pid param, never interpolated (R2). isSafeId above stays
+      // as defense-in-depth.
       setLoadingProcess(processId);
       try {
         const stepsQuery = `
-                MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${processId.replace(/'/g, "''")}'})
+                MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $pid})
                 RETURN s.id AS id
             `;
-        const stepsResult = await runQuery(stepsQuery);
+        const stepsResult = await runQuery(stepsQuery, { pid: processId });
         const stepIds = stepsResult.map((row: any) => row.id || row[0]);
 
         // Cache the result
@@ -364,7 +373,7 @@ export const ProcessesPanel = () => {
       </div>
 
       {/* Process list */}
-      <div className="scrollbar-thin flex-1 overflow-y-auto">
+      <div className="flex-1 scrollbar-thin overflow-y-auto">
         {/* View All Processes Card */}
         <div className="px-4 py-3">
           <button

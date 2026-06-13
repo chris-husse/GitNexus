@@ -72,6 +72,12 @@ export const MermaidDiagram = ({ code }: MermaidDiagramProps) => {
 
         // Render the diagram
         const { svg: renderedSvg } = await mermaid.render(id, code.trim());
+        // `renderedSvg` is the Mermaid-rendered diagram; sanitize before storing.
+        // `foreignObject` is required because flowchart htmlLabels:true renders
+        // node labels inside <foreignObject>; dropping it from ADD_TAGS strips
+        // every node label and the diagram renders blank. DOMPurify's defaults
+        // still strip event-handler (on*) and script attributes. Kept
+        // intentionally — matches ProcessFlowModal (R8/E2).
         const sanitizedSvg = DOMPurify.sanitize(renderedSvg, {
           USE_PROFILES: { svg: true, svgFilters: true },
           ADD_TAGS: ['foreignObject'],
@@ -151,6 +157,12 @@ export const MermaidDiagram = ({ code }: MermaidDiagramProps) => {
           <div
             ref={containerRef}
             className="flex max-h-[400px] items-center justify-center overflow-auto p-4"
+            // `svg` was already sanitized in renderDiagram; re-sanitize at the
+            // injection sink as defense-in-depth. `foreignObject` is required
+            // because flowchart htmlLabels:true renders node labels inside
+            // <foreignObject> — dropping it strips every label and the diagram
+            // renders blank. DOMPurify's defaults still strip on*/script
+            // attributes. Kept intentionally — matches ProcessFlowModal (R8/E2).
             dangerouslySetInnerHTML={{
               __html: DOMPurify.sanitize(svg, {
                 USE_PROFILES: { svg: true, svgFilters: true },
