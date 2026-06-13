@@ -75,7 +75,7 @@
   "loadingModels": "正在加载模型...",
   "noModelsMatch": "没有匹配“{{searchTerm}}”的模型",
   "moreModels": "+{{count}} 个更多模型 • 缩小搜索范围",
-  "apiKeySession": "API Key 保存在会话存储中，关闭此标签页后会被清除。",
+  "apiKeySession": "API Key 仅在本次会话的内存中保留，不会写入任何存储，刷新页面后需重新输入。",
   "startLocalServer": "启动本地服务器",
   "settingsSaved": "设置已保存",
   "failedToSave": "保存失败",
@@ -89,5 +89,5 @@
   "openRouterModels": "OpenRouter Models",
   "zaiPlatform": "Z.AI Platform",
   "glmCodingApi": "Coding API（默认）。通用 API 请使用 https://api.z.ai/api/paas/v4。",
-  "privacyFull": "你的 API Key 只保存在此浏览器的会话存储中，关闭标签页后会清除。聊天时会直接发送给 LLM 提供商，你的代码不会离开本机。"
+  "privacyFull": "你的 API Key 仅在本次会话的内存中保留，绝不会写入浏览器存储，刷新后需重新输入。聊天时会直接发送给 LLM 提供商，你的代码不会离开本机。"
 }

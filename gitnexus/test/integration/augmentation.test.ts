@@ -183,8 +183,10 @@ withTestLbugDB(
 
       it('returns empty string when fallback CONTAINS query throws', async () => {
         const poolAdapter = await import('../../src/core/lbug/pool-adapter.js');
+        // R1: the FTS-unavailable fallback now uses executeParameterized (bound
+        // $needle) instead of executeQuery, so the failure is injected there.
         const spy = vi
-          .spyOn(poolAdapter, 'executeQuery')
+          .spyOn(poolAdapter, 'executeParameterized')
           .mockRejectedValue(new Error('simulated DB error'));
         try {
           const result = await augmentNoFts('login', handle.dbPath);

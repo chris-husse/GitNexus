@@ -75,7 +75,7 @@
   "loadingModels": "Loading models...",
   "noModelsMatch": "No models match \"{{searchTerm}}\"",
   "moreModels": "+{{count}} more • Refine your search",
-  "apiKeySession": "API keys are stored in session storage and will be cleared when you close this tab.",
+  "apiKeySession": "API keys are kept in memory for this session only — they are never saved to storage and must be re-entered after a page refresh.",
   "startLocalServer": "start the local server",
   "settingsSaved": "Settings saved",
   "failedToSave": "Failed to save",
@@ -89,5 +89,5 @@
   "openRouterModels": "OpenRouter Models",
   "zaiPlatform": "Z.AI Platform",
   "glmCodingApi": "Coding API (default). Use https://api.z.ai/api/paas/v4 for the general API.",
-  "privacyFull": "Your API keys are stored only in your browser's session storage and are cleared when the tab closes. They're sent directly to the LLM provider when you chat. Your code never leaves your machine."
+  "privacyFull": "Your API keys are kept only in memory for the current session — they are never written to browser storage and must be re-entered after a refresh. They're sent directly to the LLM provider when you chat. Your code never leaves your machine."
 }

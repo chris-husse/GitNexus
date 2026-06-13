@@ -88,6 +88,17 @@
     "@vercel/python-analysis": {
       "minimatch": "10.2.3",
       "smol-toml": "1.6.1"
+    },
+    "esbuild": "0.28.1",
+    "joi": "18.2.1",
+    "@langchain/langgraph": {
+      "uuid": "^11.1.1"
+    },
+    "@langchain/langgraph-checkpoint": {
+      "uuid": "^11.1.1"
+    },
+    "@langchain/ollama": {
+      "uuid": "^11.1.1"
     }
   }
 }

@@ -161,6 +161,10 @@ export const ProcessFlowModal = ({
 
         const { svg } = await mermaid.render(id, mermaidCode);
         if (!diagramRef.current) return;
+        // `svg` is the Mermaid-rendered diagram; sanitize before injecting.
+        // `foreignObject` is required because flowchart htmlLabels:true renders
+        // node labels inside <foreignObject>; dropping it from ADD_TAGS strips
+        // every node label and the diagram renders blank. Kept intentionally.
         diagramRef.current!.innerHTML = DOMPurify.sanitize(svg, {
           USE_PROFILES: { svg: true, svgFilters: true },
           ADD_TAGS: ['foreignObject'],
@@ -170,20 +174,30 @@ export const ProcessFlowModal = ({
         const errorMessage = error instanceof Error ? error.message : String(error);
         const isSizeError = errorMessage.includes('Maximum') || errorMessage.includes('exceeded');
 
-        diagramRef.current!.innerHTML = `
-          <div class="text-center p-8">
-            <div class="text-red-400 text-sm font-medium mb-2">
-              ${isSizeError ? t('graph:processFlow.diagramTooLarge') : t('graph:processFlow.renderError')}
-            </div>
-            <div class="text-slate-400 text-xs max-w-md">
-              ${
-                isSizeError
-                  ? t('graph:processFlow.tooComplex', { count: process.steps?.length || 0 })
-                  : t('graph:processFlow.unableToRender', { count: process.steps?.length || 0 })
-              }
-            </div>
-          </div>
-        `;
+        // Build the error UI via DOM APIs with textContent so no raw innerHTML
+        // of templated/translated content is assigned (R8). The translated
+        // strings are project-controlled, but constructing nodes keeps a strict
+        // no-innerHTML-of-templates invariant for this attacker-adjacent view.
+        const container = diagramRef.current!;
+        container.replaceChildren();
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'text-center p-8';
+
+        const title = document.createElement('div');
+        title.className = 'text-red-400 text-sm font-medium mb-2';
+        title.textContent = isSizeError
+          ? t('graph:processFlow.diagramTooLarge')
+          : t('graph:processFlow.renderError');
+
+        const detail = document.createElement('div');
+        detail.className = 'text-slate-400 text-xs max-w-md';
+        detail.textContent = isSizeError
+          ? t('graph:processFlow.tooComplex', { count: process.steps?.length || 0 })
+          : t('graph:processFlow.unableToRender', { count: process.steps?.length || 0 });
+
+        wrapper.append(title, detail);
+        container.append(wrapper);
       }
     };
 

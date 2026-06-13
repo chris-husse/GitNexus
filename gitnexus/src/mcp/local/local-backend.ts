@@ -1975,7 +1975,8 @@ export class LocalBackend {
     }
     if (request.params !== undefined && !isValidQueryParams(request.params)) {
       return {
-        error: '"params" must be a plain object with scalar values (string/number/boolean/null).',
+        error:
+          '"params" must be a plain object whose values are scalars (string/number/boolean/null) or arrays of such scalars.',
       };
     }
 

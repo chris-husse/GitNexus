@@ -20,7 +20,7 @@ import type {
 } from '../core/llm/types';
 import {
   loadSettings,
-  getActiveProviderConfig,
+  getProviderConfigFromSettings,
   getProviderCapabilities,
   saveSettings,
 } from '../core/llm/settings-service';
@@ -38,6 +38,7 @@ import {
   type BackendRepo,
   type ConnectResult,
   type JobProgress,
+  type QueryParamValue,
 } from '../services/backend-client';
 import { ERROR_RESET_DELAY_MS } from '../config/ui-constants';
 import i18n from '../i18n';
@@ -50,6 +51,35 @@ export const AUTO_START_EMBEDDINGS_STORAGE_KEY = 'gitnexus.autoStartEmbeddings';
 export const shouldAutoStartEmbeddings = (): boolean => {
   if (typeof window === 'undefined' || !window.localStorage) return false;
   return window.localStorage.getItem(AUTO_START_EMBEDDINGS_STORAGE_KEY) === 'true';
+};
+
+/**
+ * Resolve control-marker IDs (from `[HIGHLIGHT_NODES:…]` / `[IMPACT:…]` tool
+ * results) against the live graph node set. Only IDs that exist in the graph —
+ * either as an exact match or as a unique suffix of a real node ID — may drive
+ * highlight / blast-radius UI state.
+ *
+ * Security (R11): tool output is partly attacker-influenced (it can echo
+ * adversarial repository symbol names). IDs that don't correspond to a real
+ * graph node are dropped; there is deliberately NO fallback that trusts the raw
+ * marker IDs. An all-unknown marker therefore highlights nothing.
+ */
+export const resolveMarkerIds = (rawIds: string[], graphNodeIds: Set<string>): Set<string> => {
+  const matched = new Set<string>();
+  for (const rawId of rawIds) {
+    if (graphNodeIds.has(rawId)) {
+      matched.add(rawId);
+      continue;
+    }
+    // Allow a short id the agent emitted to resolve to a real node by suffix.
+    for (const id of graphNodeIds) {
+      if (id.endsWith(rawId) || id.endsWith(':' + rawId)) {
+        matched.add(id);
+        break;
+      }
+    }
+  }
+  return matched;
 };
 
 export type ViewMode = 'onboarding' | 'loading' | 'exploring';
@@ -612,9 +642,21 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     graphModeRef.current = graphMode;
   }, [graphMode]);
 
+  // Mirror llmSettings into a ref so initializeAgent (a stable, dep-free
+  // callback) and its deferred callers can read the CURRENT settings — which
+  // carry the session's memory-only API key (R10) — without re-creating the
+  // callback. Secrets are never persisted, so reading from storage would yield
+  // a keyless config; the in-memory state is the source of truth.
+  const llmSettingsRef = useRef(llmSettings);
+  useEffect(() => {
+    llmSettingsRef.current = llmSettings;
+  }, [llmSettings]);
+
   const initializeAgent = useCallback(
     async (overrideProjectName?: string, opts?: { chatOnly?: boolean }): Promise<void> => {
-      const config = getActiveProviderConfig();
+      // Build the config from the in-memory settings (which hold the session's
+      // memory-only API key); storage never has the key (R10).
+      const config = getProviderConfigFromSettings(llmSettingsRef.current);
       if (!config) {
         setAgentError('Please configure an LLM provider in settings');
         return;
@@ -641,7 +683,12 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         const { createGraphRAGAgent } = await import('../core/llm/agent');
         const { buildCodebaseContext } = await import('../core/llm/context-builder');
 
-        const executeQuery = (cypher: string) => backendRunQuery(cypher, repo);
+        // Forward optional bind params so the Graph RAG tools can use prepared
+        // statements ($params) instead of interpolating untrusted graph-derived
+        // values into Cypher (R2). `params` is undefined for callers that don't
+        // pass it (e.g. context-builder), keeping the request body unchanged.
+        const executeQuery = (cypher: string, params?: Record<string, QueryParamValue>) =>
+          backendRunQuery(cypher, repo, params);
         const codebaseContext = await buildCodebaseContext(executeQuery, effectiveProjectName);
 
         const backend = {
@@ -978,68 +1025,38 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
                 scheduleMessageUpdate();
 
-                // Parse highlight marker from tool results
-                if (tc.result) {
-                  const highlightMatch = tc.result.match(/\[HIGHLIGHT_NODES:([^\]]+)\]/);
-                  if (highlightMatch) {
-                    const rawIds = highlightMatch[1]
+                // Parse control markers from tool results. IDs are ALWAYS
+                // validated against the live graph node set before driving UI
+                // state — tool output is partly attacker-influenced, so an
+                // unvalidated id must never highlight a node (R11). No graph =
+                // no validation source = nothing to highlight.
+                if (tc.result && graph) {
+                  const graphNodeIdSet = new Set(graph.nodes.map((n) => n.id));
+                  const parseMarkerIds = (raw: string): string[] =>
+                    raw
                       .split(',')
                       .map((id: string) => id.trim())
                       .filter(Boolean);
-                    if (rawIds.length > 0 && graph) {
-                      const matchedIds = new Set<string>();
-                      const graphNodeIdSet = new Set(graph.nodes.map((n) => n.id));
 
-                      for (const rawId of rawIds) {
-                        if (graphNodeIdSet.has(rawId)) {
-                          matchedIds.add(rawId);
-                        } else {
-                          const found = graph.nodes.find(
-                            (n) => n.id.endsWith(rawId) || n.id.endsWith(':' + rawId),
-                          )?.id;
-                          if (found) {
-                            matchedIds.add(found);
-                          }
-                        }
-                      }
-
-                      if (matchedIds.size > 0) {
-                        setAIToolHighlightedNodeIds(matchedIds);
-                      }
-                    } else if (rawIds.length > 0) {
-                      setAIToolHighlightedNodeIds(new Set(rawIds));
+                  const highlightMatch = tc.result.match(/\[HIGHLIGHT_NODES:([^\]]+)\]/);
+                  if (highlightMatch) {
+                    const matchedIds = resolveMarkerIds(
+                      parseMarkerIds(highlightMatch[1]),
+                      graphNodeIdSet,
+                    );
+                    if (matchedIds.size > 0) {
+                      setAIToolHighlightedNodeIds(matchedIds);
                     }
                   }
 
-                  // Parse impact marker from tool results
                   const impactMatch = tc.result.match(/\[IMPACT:([^\]]+)\]/);
                   if (impactMatch) {
-                    const rawIds = impactMatch[1]
-                      .split(',')
-                      .map((id: string) => id.trim())
-                      .filter(Boolean);
-                    if (rawIds.length > 0 && graph) {
-                      const matchedIds = new Set<string>();
-                      const graphNodeIdSet = new Set(graph.nodes.map((n) => n.id));
-
-                      for (const rawId of rawIds) {
-                        if (graphNodeIdSet.has(rawId)) {
-                          matchedIds.add(rawId);
-                        } else {
-                          const found = graph.nodes.find(
-                            (n) => n.id.endsWith(rawId) || n.id.endsWith(':' + rawId),
-                          )?.id;
-                          if (found) {
-                            matchedIds.add(found);
-                          }
-                        }
-                      }
-
-                      if (matchedIds.size > 0) {
-                        setBlastRadiusNodeIds(matchedIds);
-                      }
-                    } else if (rawIds.length > 0) {
-                      setBlastRadiusNodeIds(new Set(rawIds));
+                    const matchedIds = resolveMarkerIds(
+                      parseMarkerIds(impactMatch[1]),
+                      graphNodeIdSet,
+                    );
+                    if (matchedIds.size > 0) {
+                      setBlastRadiusNodeIds(matchedIds);
                     }
                   }
                 }
@@ -1278,7 +1295,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
       // Re-initialize agent with the new repo's graph context
       try {
-        if (getActiveProviderConfig()) {
+        if (getProviderConfigFromSettings(llmSettingsRef.current)) {
           await initializeAgent(pNameStr, { chatOnly: connectedChatOnly });
         }
         setViewMode('exploring');
@@ -1389,7 +1406,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       // The graph is now loaded — re-init the agent so its system prompt drops
       // the chat-only note (#2178, KTD2). Guarded on a configured provider, like
       // switchRepo; runs inside the mounted/stale guard above.
-      if (getActiveProviderConfig()) {
+      if (getProviderConfigFromSettings(llmSettingsRef.current)) {
         await initializeAgent(repo, { chatOnly: false });
       }
     } catch (err) {
