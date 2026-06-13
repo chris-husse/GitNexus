@@ -204,7 +204,10 @@ interface AppState {
   loadGraphAnyway: () => Promise<void>;
 
   // Worker API (shared across app)
-  runQuery: (cypher: string) => Promise<any[]>;
+  // `params` binds value positions via prepared-statement placeholders ($name)
+  // so untrusted (graph-derived) values are never interpolated into `cypher`
+  // (R2 — Cypher-injection prevention). Forwarded to the backend /api/query.
+  runQuery: (cypher: string, params?: Record<string, QueryParamValue>) => Promise<any[]>;
   isDatabaseReady: () => Promise<boolean>;
 
   // Embedding state
@@ -523,9 +526,12 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     repoRef.current = repoName;
   }, []);
 
-  const runQuery = useCallback(async (cypher: string): Promise<any[]> => {
-    return backendRunQuery(cypher, repoRef.current);
-  }, []);
+  const runQuery = useCallback(
+    async (cypher: string, params?: Record<string, QueryParamValue>): Promise<any[]> => {
+      return backendRunQuery(cypher, repoRef.current, params);
+    },
+    [],
+  );
 
   const isDatabaseReady = useCallback(async (): Promise<boolean> => {
     return probeBackend();
