@@ -1519,7 +1519,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             const { semanticSearch: semSearch } =
               await import('../core/embeddings/embedding-pipeline.js');
-            searchResults = await semSearch(executeQuery, query, limit);
+            // Pass executePrepared so the per-label metadata fetch binds node
+            // ids as a parameter instead of interpolating them (R3).
+            searchResults = await semSearch(executeQuery, query, limit, undefined, executePrepared);
             // Normalize semantic results to HybridSearchResult shape
             searchResults = searchResults.map((r: any, i: number) => ({
               ...r,
@@ -1541,11 +1543,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             if (isEmbedderReady()) {
               const { semanticSearch: semSearch } =
                 await import('../core/embeddings/embedding-pipeline.js');
+              // Bind executePrepared into the injected semanticSearch so the
+              // per-label metadata fetch binds node ids as a parameter (R3).
+              const semSearchBound = (
+                eq: (cypher: string) => Promise<any[]>,
+                q: string,
+                k?: number,
+              ) => semSearch(eq, q, k, undefined, executePrepared);
               searchResults = await hybridSearch(
                 query,
                 limit,
                 executeQuery,
-                semSearch,
+                semSearchBound,
                 ftsDisabledReason,
               );
               if (ftsDisabledReason) ftsAvailable = false;
