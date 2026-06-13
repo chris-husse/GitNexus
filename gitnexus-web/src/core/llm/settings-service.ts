@@ -1,8 +1,18 @@
 /**
  * Settings Service
  *
- * Handles localStorage persistence for LLM provider settings.
- * All API keys are stored locally - never sent to any server except the LLM provider.
+ * Persists NON-SECRET LLM provider preferences (active provider, model,
+ * baseUrl, endpoint, deploymentName, apiVersion, temperature, maxTokens) to
+ * sessionStorage.
+ *
+ * Secrets (API keys / auth tokens) are MEMORY-ONLY (R10): they are never
+ * written to sessionStorage or localStorage. They live only in the in-memory
+ * React state (`llmSettings` in useAppState) for the current session and must
+ * be re-entered after a page refresh. `loadSettings` additionally wipes any
+ * previously-persisted secrets from both storages (cleanup migration).
+ *
+ * API keys are sent only to the configured LLM provider when you chat — never
+ * to the GitNexus backend.
  */
 
 import {
@@ -24,6 +34,55 @@ import { DEFAULT_OPENROUTER_BASE_URL, DEFAULT_OLLAMA_BASE_URL } from '../../conf
 import { resilientFetch } from 'gitnexus-shared';
 
 const STORAGE_KEY = 'gitnexus-llm-settings';
+
+/**
+ * Secret fields that must NEVER be persisted to storage (R10). `apiKey` is the
+ * only secret in the current provider configs; `authToken` is listed defensively
+ * so any future auth-token field is stripped by default too.
+ */
+const SECRET_PROVIDER_FIELDS = ['apiKey', 'authToken'] as const;
+
+/** Provider keys on LLMSettings whose config objects may hold secret fields. */
+const PROVIDER_KEYS: (keyof LLMSettings)[] = [
+  'openai',
+  'azureOpenAI',
+  'gemini',
+  'anthropic',
+  'ollama',
+  'openrouter',
+  'minimax',
+  'glm',
+  'deepseek',
+  'clusteringProvider',
+];
+
+/** Remove all secret fields from a single provider-config object (shallow copy). */
+const stripSecretsFromConfig = (config: unknown): unknown => {
+  if (!config || typeof config !== 'object') return config;
+  const clone: Record<string, unknown> = { ...(config as Record<string, unknown>) };
+  for (const field of SECRET_PROVIDER_FIELDS) {
+    delete clone[field];
+  }
+  return clone;
+};
+
+/**
+ * Return a copy of settings with every secret field stripped from every
+ * provider config. Used before any write to storage so secrets are never
+ * serialized (R10). The returned object is safe to JSON.stringify into storage.
+ */
+const stripSecrets = (settings: LLMSettings): LLMSettings => {
+  // Work on an untyped mutable view so we can rewrite the provider config keys
+  // without widening LLMSettings to an index-signature type.
+  const out = { ...settings } as unknown as Record<string, unknown>;
+  for (const key of PROVIDER_KEYS) {
+    const config = out[key as string];
+    if (config && typeof config === 'object') {
+      out[key as string] = stripSecretsFromConfig(config);
+    }
+  }
+  return out as unknown as LLMSettings;
+};
 
 const mergeWithDefaults = (parsed?: Partial<LLMSettings> | null): LLMSettings => ({
   ...DEFAULT_LLM_SETTINGS,
@@ -77,28 +136,63 @@ const readSettings = (storage: Storage): Partial<LLMSettings> | null => {
   }
 };
 
+/** Write NON-SECRET settings to storage. Secrets are stripped first (R10). */
 const writeSettings = (storage: Storage, settings: LLMSettings): void => {
-  storage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  storage.setItem(STORAGE_KEY, JSON.stringify(stripSecrets(settings)));
+};
+
+/** True if the raw stored JSON appears to contain any secret field. */
+const rawHasSecret = (raw: string | null): boolean =>
+  !!raw && SECRET_PROVIDER_FIELDS.some((field) => raw.includes(`"${field}"`));
+
+/**
+ * Re-persist a secret-free copy of an already-persisted blob, or remove it.
+ * This is the cleanup migration that wipes any secret a previous app version
+ * may have written to `storage` (R10). Best-effort: storage errors are ignored.
+ */
+const wipePersistedSecrets = (storage: Storage, parsed: Partial<LLMSettings>): void => {
+  try {
+    const raw = storage.getItem(STORAGE_KEY);
+    if (!rawHasSecret(raw)) return; // nothing secret persisted here
+    // Rewrite the stripped, non-secret prefs so the user's choices survive.
+    storage.setItem(STORAGE_KEY, JSON.stringify(stripSecrets(mergeWithDefaults(parsed))));
+  } catch {
+    // ignore — wiping is best-effort
+  }
 };
 
 /**
- * Load settings from sessionStorage (migrates legacy localStorage once).
+ * Load NON-SECRET settings from sessionStorage (migrating legacy localStorage
+ * once). Secrets are NEVER returned from storage; key fields come back empty.
+ * Any secret previously persisted to either storage is wiped (R10).
  */
 export const loadSettings = (): LLMSettings => {
   try {
     const sessionData = typeof sessionStorage !== 'undefined' ? readSettings(sessionStorage) : null;
     if (sessionData) {
-      return mergeWithDefaults(sessionData);
+      // Cleanup migration: scrub any secret a prior version persisted.
+      if (typeof sessionStorage !== 'undefined') wipePersistedSecrets(sessionStorage, sessionData);
+      // Also remove any lingering legacy localStorage copy (it may hold a secret).
+      if (typeof localStorage !== 'undefined' && rawHasSecret(localStorage.getItem(STORAGE_KEY))) {
+        try {
+          localStorage.removeItem(STORAGE_KEY);
+        } catch {
+          // ignore
+        }
+      }
+      // Strip secrets from the in-memory result too, so callers never see them.
+      return stripSecrets(mergeWithDefaults(sessionData));
     }
 
     const legacyData = typeof localStorage !== 'undefined' ? readSettings(localStorage) : null;
     if (legacyData) {
-      const merged = mergeWithDefaults(legacyData);
+      const merged = stripSecrets(mergeWithDefaults(legacyData));
       try {
         if (typeof sessionStorage !== 'undefined') {
           writeSettings(sessionStorage, merged);
         }
         if (typeof localStorage !== 'undefined') {
+          // Drop the legacy blob entirely — it may contain a persisted secret.
           localStorage.removeItem(STORAGE_KEY);
         }
       } catch (error) {
@@ -115,7 +209,9 @@ export const loadSettings = (): LLMSettings => {
 };
 
 /**
- * Save settings to sessionStorage
+ * Save settings to sessionStorage. Secrets are stripped before writing (R10) —
+ * the in-memory `settings` argument may carry an API key for the live session,
+ * but only its non-secret fields are persisted.
  */
 export const saveSettings = (settings: LLMSettings): void => {
   try {
@@ -340,14 +436,39 @@ const providerBuilders: Record<LLMProvider, ProviderBuilder> = {
   },
 };
 
-export const getActiveProviderConfig = (): ProviderConfig | null => {
-  const settings = loadSettings();
+/**
+ * Build the active provider's runtime config from an IN-MEMORY settings object.
+ *
+ * Prefer this over `getActiveProviderConfig()` whenever the live React state is
+ * available (R10): secrets are memory-only and are stripped from storage, so a
+ * config built from `loadSettings()` will lack the API key for key-requiring
+ * providers. Pass `llmSettings` (which holds the working key for the session).
+ */
+export const getProviderConfigFromSettings = (settings: LLMSettings): ProviderConfig | null => {
   const builder = providerBuilders[settings.activeProvider];
   return builder ? builder(settings) : null;
 };
 
+/** Check whether the active provider in an in-memory settings object is configured. */
+export const isSettingsConfigured = (settings: LLMSettings): boolean =>
+  getProviderConfigFromSettings(settings) !== null;
+
 /**
- * Check if the active provider is properly configured
+ * Build the active provider config from STORAGE.
+ *
+ * NOTE (R10): secrets are not persisted, so this returns a usable config only
+ * for providers that need no API key (e.g. Ollama). For key-requiring providers
+ * use `getProviderConfigFromSettings(llmSettings)` with the in-memory state.
+ */
+export const getActiveProviderConfig = (): ProviderConfig | null => {
+  return getProviderConfigFromSettings(loadSettings());
+};
+
+/**
+ * Check if the active provider is properly configured, reading from STORAGE.
+ *
+ * NOTE (R10): for key-requiring providers prefer `isSettingsConfigured(llmSettings)`
+ * with the in-memory state, since the persisted prefs never include the key.
  */
 export const isProviderConfigured = (): boolean => {
   return getActiveProviderConfig() !== null;

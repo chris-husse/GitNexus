@@ -700,15 +700,34 @@ const parseNdjsonGraphResponse = async (
   return { nodes, relationships };
 };
 
-/** Execute a Cypher query. Returns rows. */
+/**
+ * Bindable parameter value for a prepared Cypher query: a scalar or an array of
+ * scalars (e.g. for `WHERE n.id IN $ids`). Nested objects are intentionally
+ * unsupported — the server's `/api/query` validator rejects them. Keeping
+ * value-position data in `params` (never interpolated into `cypher`) is what
+ * prevents Cypher injection from adversarial graph-derived strings (R2).
+ */
+export type QueryParamValue =
+  | string
+  | number
+  | boolean
+  | null
+  | Array<string | number | boolean | null>;
+
+/** Execute a Cypher query. Returns rows.
+ * Pass `params` to bind value positions via prepared-statement placeholders
+ * (`$name`) instead of interpolating untrusted values into `cypher`. `params`
+ * is omitted from the request body when undefined to stay backward-compatible
+ * with older servers. */
 export const runQuery = async (
   cypher: string,
   repo?: string,
+  params?: Record<string, QueryParamValue>,
 ): Promise<Record<string, unknown>[]> => {
   const response = await fetchWithTimeout(`${_backendUrl}/api/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cypher, repo }),
+    body: JSON.stringify(params !== undefined ? { cypher, repo, params } : { cypher, repo }),
   });
   await assertOk(response);
   const body = await response.json();

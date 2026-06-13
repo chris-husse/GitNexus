@@ -14,7 +14,18 @@
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { NODE_TABLES, REL_TYPES } from 'gitnexus-shared';
-import type { EnrichedSearchResult, GrepResult } from '../../services/backend-client';
+import type {
+  EnrichedSearchResult,
+  GrepResult,
+  QueryParamValue,
+} from '../../services/backend-client';
+
+/**
+ * Named bind parameters for a prepared Cypher query. Value positions
+ * (symbol/file names, ids, paths, id-lists) MUST be passed here rather than
+ * interpolated into the query string — this is the Cypher-injection fix (R2).
+ */
+export type QueryParams = Record<string, QueryParamValue>;
 
 /**
  * Tool names registered by createGraphRAGTools — kept in sync with each tool's `name`
@@ -39,7 +50,7 @@ const validRelType = (t: string): boolean => (REL_TYPES as readonly string[]).in
  * All queries go through the backend HTTP API.
  */
 export interface GraphRAGBackend {
-  executeQuery: (cypher: string) => Promise<Record<string, unknown>[]>;
+  executeQuery: (cypher: string, params?: QueryParams) => Promise<Record<string, unknown>[]>;
   search: (
     query: string,
     opts?: { limit?: number; mode?: 'hybrid' | 'semantic' | 'bm25'; enrich?: boolean },
@@ -567,7 +578,6 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       target: string;
       type?: 'symbol' | 'cluster' | 'process' | null;
     }) => {
-      const safeTarget = target.replace(/'/g, "''");
       let resolvedType = type ?? null;
       let processRow: any | null = null;
       let communityRow: any | null = null;
@@ -579,11 +589,11 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       if (!resolvedType || resolvedType === 'process') {
         const processQuery = `
           MATCH (p:Process)
-          WHERE p.id = '${safeTarget}' OR p.label = '${safeTarget}'
+          WHERE p.id = $target OR p.label = $target
           RETURN p.id AS id, p.label AS label, p.processType AS type, p.stepCount AS stepCount
           LIMIT 1
         `;
-        const processRes = await executeQuery(processQuery);
+        const processRes = await executeQuery(processQuery, { target });
         if (processRes.length > 0) {
           processRow = processRes[0];
           resolvedType = 'process';
@@ -593,11 +603,11 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       if (!resolvedType || resolvedType === 'cluster') {
         const communityQuery = `
           MATCH (c:Community)
-          WHERE c.id = '${safeTarget}' OR c.label = '${safeTarget}' OR c.heuristicLabel = '${safeTarget}'
+          WHERE c.id = $target OR c.label = $target OR c.heuristicLabel = $target
           RETURN c.id AS id, c.label AS label, c.cohesion AS cohesion, c.symbolCount AS symbolCount, c.description AS description
           LIMIT 1
         `;
-        const communityRes = await executeQuery(communityQuery);
+        const communityRes = await executeQuery(communityQuery, { target });
         if (communityRes.length > 0) {
           communityRow = communityRes[0];
           resolvedType = 'cluster';
@@ -607,11 +617,11 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       if (!resolvedType || resolvedType === 'symbol') {
         const symbolQuery = `
           MATCH (n)
-          WHERE n.name = '${safeTarget}' OR n.id = '${safeTarget}' OR n.filePath = '${safeTarget}'
+          WHERE n.name = $target OR n.id = $target OR n.filePath = $target
           RETURN n.id AS id, n.name AS name, n.filePath AS filePath, label(n) AS nodeType
           LIMIT 5
         `;
-        const symbolRes = await executeQuery(symbolQuery);
+        const symbolRes = await executeQuery(symbolQuery, { target });
         if (symbolRes.length > 0) {
           symbolRow = symbolRes[0];
           resolvedType = 'symbol';
@@ -629,21 +639,21 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         const stepCount = getRowValue(processRow, 3, 'stepCount');
 
         const stepsQuery = `
-          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${pid.replace(/'/g, "''")}'})
+          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $pid})
           RETURN s.name AS name, s.filePath AS filePath, r.step AS step
           ORDER BY r.step
         `;
         const clustersQuery = `
           MATCH (c:Community)<-[:CodeRelation {type: 'MEMBER_OF'}]-(s)
-          MATCH (s)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${pid.replace(/'/g, "''")}'})
+          MATCH (s)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: $pid})
           RETURN DISTINCT c.id AS id, c.label AS label, c.description AS description
           ORDER BY c.label
           LIMIT 20
         `;
 
         const [steps, clusters] = await Promise.all([
-          executeQuery(stepsQuery),
-          executeQuery(clustersQuery),
+          executeQuery(stepsQuery, { pid }),
+          executeQuery(clustersQuery, { pid }),
         ]);
 
         const stepLines = steps.map((row: any) => {
@@ -680,12 +690,12 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         const description = getRowValue(communityRow, 4, 'description');
 
         const membersQuery = `
-          MATCH (c:Community {id: '${cid.replace(/'/g, "''")}'})<-[:CodeRelation {type: 'MEMBER_OF'}]-(m)
+          MATCH (c:Community {id: $cid})<-[:CodeRelation {type: 'MEMBER_OF'}]-(m)
           RETURN m.name AS name, m.filePath AS filePath, label(m) AS nodeType
           LIMIT 50
         `;
         const processesQuery = `
-          MATCH (c:Community {id: '${cid.replace(/'/g, "''")}'})<-[:CodeRelation {type: 'MEMBER_OF'}]-(s)
+          MATCH (c:Community {id: $cid})<-[:CodeRelation {type: 'MEMBER_OF'}]-(s)
           MATCH (s)-[:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           RETURN DISTINCT p.id AS id, p.label AS label, p.stepCount AS stepCount
           ORDER BY p.stepCount DESC
@@ -693,8 +703,8 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         `;
 
         const [members, processes] = await Promise.all([
-          executeQuery(membersQuery),
-          executeQuery(processesQuery),
+          executeQuery(membersQuery, { cid }),
+          executeQuery(processesQuery, { cid }),
         ]);
 
         const memberLines = members.map((row: any) => {
@@ -734,32 +744,35 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           return `Unknown node type "${nodeType}" for symbol "${target}".`;
         }
 
+        // `nodeType` is a label position, guarded by the validLabel allowlist
+        // above; `nodeId` is a value position bound as a $param (R2).
+        const symbolId = String(nodeId);
         const clusterQuery = `
-          MATCH (n:${nodeType} {id: '${String(nodeId).replace(/'/g, "''")}'})
+          MATCH (n:${nodeType} {id: $nodeId})
           MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           RETURN c.label AS label, c.description AS description
           LIMIT 1
         `;
         const processQuery = `
-          MATCH (n:${nodeType} {id: '${String(nodeId).replace(/'/g, "''")}'})
+          MATCH (n:${nodeType} {id: $nodeId})
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           RETURN p.label AS label, r.step AS step, p.stepCount AS stepCount
           ORDER BY r.step
         `;
         const connectionsQuery = `
-          MATCH (n:${nodeType} {id: '${String(nodeId).replace(/'/g, "''")}'})
+          MATCH (n:${nodeType} {id: $nodeId})
           OPTIONAL MATCH (n)-[r1:CodeRelation]->(dst)
           OPTIONAL MATCH (src)-[r2:CodeRelation]->(n)
-          RETURN 
+          RETURN
             collect(DISTINCT {name: dst.name, type: r1.type, confidence: r1.confidence}) AS outgoing,
             collect(DISTINCT {name: src.name, type: r2.type, confidence: r2.confidence}) AS incoming
           LIMIT 1
         `;
 
         const [clusterRes, processRes, connRes] = await Promise.all([
-          executeQuery(clusterQuery),
-          executeQuery(processQuery),
-          executeQuery(connectionsQuery),
+          executeQuery(clusterQuery, { nodeId: symbolId }),
+          executeQuery(processQuery, { nodeId: symbolId }),
+          executeQuery(connectionsQuery, { nodeId: symbolId }),
         ]);
 
         const clusterLabel =
@@ -875,7 +888,9 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       if (activeRelTypes.length === 0) {
         return `No valid relation types provided. Valid types: ${(REL_TYPES as readonly string[]).join(', ')}`;
       }
-      const relTypeFilter = activeRelTypes.map((t) => `'${t.replace(/'/g, "''")}'`).join(', ');
+      // activeRelTypes is already filtered to the validRelType allowlist; it is
+      // bound as an array param (`r.type IN $relTypes`) in each depth query
+      // below rather than interpolated into the Cypher text (R2).
 
       const directionLabel =
         direction === 'upstream'
@@ -885,25 +900,24 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       // Try to find the target node first
       // If target contains '/', search by filePath; otherwise by name
       const isPathQuery = target.includes('/');
-      const escapedTarget = target.replace(/'/g, "''");
 
       const findTargetQuery = isPathQuery
         ? `
-          MATCH (n) 
-          WHERE n.filePath IS NOT NULL AND n.filePath CONTAINS '${escapedTarget}'
+          MATCH (n)
+          WHERE n.filePath IS NOT NULL AND n.filePath CONTAINS $target
           RETURN n.id AS id, label(n) AS nodeType, n.filePath AS filePath
           LIMIT 10
         `
         : `
-          MATCH (n) 
-          WHERE n.name = '${escapedTarget}'
+          MATCH (n)
+          WHERE n.name = $target
           RETURN n.id AS id, label(n) AS nodeType, n.filePath AS filePath
           LIMIT 10
         `;
 
       let targetResults;
       try {
-        targetResults = await executeQuery(findTargetQuery);
+        targetResults = await executeQuery(findTargetQuery, { target });
       } catch (error) {
         return `Error finding target "${target}": ${error}`;
       }
@@ -954,6 +968,24 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       // For code elements (Function, Class, etc.), use the direct id
       const isFileTarget = targetType === 'File';
 
+      // Value positions bound as $params (R2): the target id / file path, the
+      // relation-type allowlist array, and the confidence floor. `targetFilePath`
+      // can be undefined for file targets resolved by name; fall back to `target`.
+      const targetFilePathValue: string = targetFilePath || target;
+      const targetIdValue: string = String(targetId);
+      // Shared params for the id-based (non-file) depth queries.
+      const idQueryParams: QueryParams = {
+        targetId: targetIdValue,
+        relTypes: activeRelTypes,
+        minConf,
+      };
+      // Shared params for the file-path-based depth-1 queries.
+      const fileQueryParams: QueryParams = {
+        targetFilePath: targetFilePathValue,
+        relTypes: activeRelTypes,
+        minConf,
+      };
+
       // Query each depth level separately (LadybugDB doesn't support list comprehensions on paths)
       // For depth 1: direct connections only
       // For depth 2+: chain multiple single-hop queries
@@ -961,19 +993,20 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
 
       // Depth 1 query - direct connections with edge metadata
       // For File targets: find callers of any code element with matching filePath
+      const d1IsFile = isFileTarget;
       const d1Query =
         direction === 'upstream'
-          ? isFileTarget
+          ? d1IsFile
             ? `
             MATCH (affected)-[r:CodeRelation]->(callee)
-            WHERE callee.filePath = '${(targetFilePath || target).replace(/'/g, "''")}'
-              AND r.type IN [${relTypeFilter}]
+            WHERE callee.filePath = $targetFilePath
+              AND r.type IN $relTypes
               AND affected.filePath <> callee.filePath
-              AND (r.confidence IS NULL OR r.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r.confidence IS NULL OR r.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               1 AS depth,
@@ -983,14 +1016,14 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 300
           `
             : `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (affected)-[r:CodeRelation]->(target)
-            WHERE r.type IN [${relTypeFilter}]
-              AND (r.confidence IS NULL OR r.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+            WHERE r.type IN $relTypes
+              AND (r.confidence IS NULL OR r.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               1 AS depth,
@@ -999,17 +1032,17 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
               r.reason AS reason
             LIMIT 300
           `
-          : isFileTarget
+          : d1IsFile
             ? `
             MATCH (caller)-[r:CodeRelation]->(affected)
-            WHERE caller.filePath = '${(targetFilePath || target).replace(/'/g, "''")}'
-              AND r.type IN [${relTypeFilter}]
+            WHERE caller.filePath = $targetFilePath
+              AND r.type IN $relTypes
               AND caller.filePath <> affected.filePath
-              AND (r.confidence IS NULL OR r.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r.confidence IS NULL OR r.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               1 AS depth,
@@ -1019,14 +1052,14 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 300
           `
             : `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (target)-[r:CodeRelation]->(affected)
-            WHERE r.type IN [${relTypeFilter}]
-              AND (r.confidence IS NULL OR r.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+            WHERE r.type IN $relTypes
+              AND (r.confidence IS NULL OR r.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               1 AS depth,
@@ -1035,11 +1068,12 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
               r.reason AS reason
             LIMIT 300
           `;
+      const d1Params = d1IsFile ? fileQueryParams : idQueryParams;
       if (import.meta.env.DEV) {
         console.log(`🔍 Impact d=1 query:\n${d1Query}`);
       }
       depthQueries.push(
-        executeQuery(d1Query)
+        executeQuery(d1Query, d1Params)
           .then((results) => {
             if (import.meta.env.DEV) {
               console.log(`📊 Impact d=1 results: ${results.length} rows`);
@@ -1060,17 +1094,17 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         const d2Query =
           direction === 'upstream'
             ? `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (a)-[r1:CodeRelation]->(target)
             MATCH (affected)-[r2:CodeRelation]->(a)
-            WHERE r1.type IN [${relTypeFilter}] AND r2.type IN [${relTypeFilter}]
+            WHERE r1.type IN $relTypes AND r2.type IN $relTypes
               AND affected.id <> target.id
-              AND (r1.confidence IS NULL OR r1.confidence >= ${minConf})
-              AND (r2.confidence IS NULL OR r2.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r1.confidence IS NULL OR r1.confidence >= $minConf)
+              AND (r2.confidence IS NULL OR r2.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               2 AS depth,
@@ -1080,17 +1114,17 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 200
           `
             : `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (target)-[r1:CodeRelation]->(a)
             MATCH (a)-[r2:CodeRelation]->(affected)
-            WHERE r1.type IN [${relTypeFilter}] AND r2.type IN [${relTypeFilter}]
+            WHERE r1.type IN $relTypes AND r2.type IN $relTypes
               AND affected.id <> target.id
-              AND (r1.confidence IS NULL OR r1.confidence >= ${minConf})
-              AND (r2.confidence IS NULL OR r2.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r1.confidence IS NULL OR r1.confidence >= $minConf)
+              AND (r2.confidence IS NULL OR r2.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               2 AS depth,
@@ -1100,7 +1134,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 200
           `;
         depthQueries.push(
-          executeQuery(d2Query).catch((err) => {
+          executeQuery(d2Query, idQueryParams).catch((err) => {
             if (import.meta.env.DEV) console.warn('Impact d=2 query failed:', err);
             return [];
           }),
@@ -1112,19 +1146,19 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         const d3Query =
           direction === 'upstream'
             ? `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (a)-[r1:CodeRelation]->(target)
             MATCH (b)-[r2:CodeRelation]->(a)
             MATCH (affected)-[r3:CodeRelation]->(b)
-            WHERE r1.type IN [${relTypeFilter}] AND r2.type IN [${relTypeFilter}] AND r3.type IN [${relTypeFilter}]
+            WHERE r1.type IN $relTypes AND r2.type IN $relTypes AND r3.type IN $relTypes
               AND affected.id <> target.id AND affected.id <> a.id
-              AND (r1.confidence IS NULL OR r1.confidence >= ${minConf})
-              AND (r2.confidence IS NULL OR r2.confidence >= ${minConf})
-              AND (r3.confidence IS NULL OR r3.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r1.confidence IS NULL OR r1.confidence >= $minConf)
+              AND (r2.confidence IS NULL OR r2.confidence >= $minConf)
+              AND (r3.confidence IS NULL OR r3.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               3 AS depth,
@@ -1134,19 +1168,19 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 100
           `
             : `
-            MATCH (target {id: '${targetId.replace(/'/g, "''")}'})
+            MATCH (target {id: $targetId})
             MATCH (target)-[r1:CodeRelation]->(a)
             MATCH (a)-[r2:CodeRelation]->(b)
             MATCH (b)-[r3:CodeRelation]->(affected)
-            WHERE r1.type IN [${relTypeFilter}] AND r2.type IN [${relTypeFilter}] AND r3.type IN [${relTypeFilter}]
+            WHERE r1.type IN $relTypes AND r2.type IN $relTypes AND r3.type IN $relTypes
               AND affected.id <> target.id AND affected.id <> a.id
-              AND (r1.confidence IS NULL OR r1.confidence >= ${minConf})
-              AND (r2.confidence IS NULL OR r2.confidence >= ${minConf})
-              AND (r3.confidence IS NULL OR r3.confidence >= ${minConf})
-            RETURN DISTINCT 
-              affected.id AS id, 
-              affected.name AS name, 
-              label(affected) AS nodeType, 
+              AND (r1.confidence IS NULL OR r1.confidence >= $minConf)
+              AND (r2.confidence IS NULL OR r2.confidence >= $minConf)
+              AND (r3.confidence IS NULL OR r3.confidence >= $minConf)
+            RETURN DISTINCT
+              affected.id AS id,
+              affected.name AS name,
+              label(affected) AS nodeType,
               affected.filePath AS filePath,
               affected.startLine AS startLine,
               3 AS depth,
@@ -1156,7 +1190,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
             LIMIT 100
           `;
         depthQueries.push(
-          executeQuery(d3Query).catch((err) => {
+          executeQuery(d3Query, idQueryParams).catch((err) => {
             if (import.meta.env.DEV) console.warn('Impact d=3 query failed:', err);
             return [];
           }),
@@ -1254,7 +1288,9 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       // Affected processes and clusters
       const maxIdsForContext = 500;
       const trimmedIds = allNodeIds.slice(0, maxIdsForContext);
-      const idList = trimmedIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
+      // Node-id lists are bound as array params (`s.id IN $ids`) — never
+      // interpolated. These ids are graph-derived and thus untrusted (R2).
+      const directIds = depth1.map((n) => String(n.id));
       let affectedProcesses: Array<{
         label: string;
         hits: number;
@@ -1266,32 +1302,33 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       if (trimmedIds.length > 0) {
         const processQuery = `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE s.id IN [${idList}]
+          WHERE s.id IN $ids
           RETURN p.label AS label, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
           ORDER BY hits DESC
           LIMIT 20
         `;
         const clusterQuery = `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${idList}]
+          WHERE s.id IN $ids
           RETURN c.label AS label, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
           LIMIT 20
         `;
-        const directIdList = depth1.map((n) => `'${n.id.replace(/'/g, "''")}'`).join(', ');
         const directClusterQuery =
           depth1.length > 0
             ? `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${directIdList}]
+          WHERE s.id IN $directIds
           RETURN DISTINCT c.label AS label
         `
             : '';
 
         const [processRes, clusterRes, directClusterRes] = await Promise.all([
-          executeQuery(processQuery),
-          executeQuery(clusterQuery),
-          directClusterQuery ? executeQuery(directClusterQuery) : Promise.resolve([]),
+          executeQuery(processQuery, { ids: trimmedIds }),
+          executeQuery(clusterQuery, { ids: trimmedIds }),
+          directClusterQuery
+            ? executeQuery(directClusterQuery, { directIds })
+            : Promise.resolve([]),
         ]);
 
         const directClusterSet = new Set<string>();
