@@ -10,6 +10,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs/promises';
 import { isIP } from 'net';
+import dns from 'dns/promises';
 import { logger } from '../core/logger.js';
 import { parseRepoNameFromUrl } from '../storage/git.js';
 
@@ -65,8 +66,21 @@ const BLOCKED_HOSTNAMES = new Set([
  * Validate a git URL to prevent SSRF attacks.
  * Only allows https:// and http:// schemes. Blocks private/internal addresses,
  * IPv6 private ranges, cloud metadata hostnames, and numeric IP encodings.
+ *
+ * For non-IP hostnames this resolves the host via DNS and runs the private-IP
+ * assertions on EVERY resolved address — closing the DNS-rebinding gap where a
+ * public-looking domain resolves to a private/internal IP (D1). This is async
+ * because of the DNS lookup.
+ *
+ * Residual TOCTOU: `git` re-resolves the hostname when it opens its own
+ * connection, so an attacker controlling the authoritative DNS could return a
+ * public IP here and a private IP to git moments later. Fully closing this would
+ * require pinning the resolved IP into git's connection (e.g. --resolve / a
+ * custom resolver), which is fragile across transports and out of scope. This
+ * check closes the static "domain → private IP" case and shrinks the rebinding
+ * window; see the design spec's honesty statement.
  */
-export function validateGitUrl(url: string): void {
+export async function validateGitUrl(url: string): Promise<void> {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -126,6 +140,45 @@ export function validateGitUrl(url: string): void {
     /^198\.1[89]\./.test(host)
   ) {
     throw new Error('Cloning from private/internal addresses is not allowed');
+  }
+
+  // DNS-rebinding defense (D1): a hostname that passes every static check above
+  // can still resolve to a private/internal IP. Resolve it and run the same
+  // private-IP assertions on every returned address; reject if ANY is blocked.
+  await assertResolvedAddressesArePublic(host);
+}
+
+/**
+ * Resolve `host` and assert every resolved address is public (D1).
+ *
+ * Uses `dns.promises.lookup(host, { all: true })`, which honors the OS resolver
+ * (hosts file, search domains) the way git will when it connects — so the set we
+ * vet matches what git is most likely to use. Every address is run through the
+ * IPv4/IPv6 private-range assertions; a single private/blocked address rejects
+ * the whole URL.
+ *
+ * A lookup failure (NXDOMAIN, no records, resolver error) is treated as a hard
+ * failure: if we cannot prove the destination is public we refuse to clone
+ * rather than fall through to git with an unverified host.
+ */
+async function assertResolvedAddressesArePublic(host: string): Promise<void> {
+  let addresses: Array<{ address: string; family: number }>;
+  try {
+    addresses = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('Could not resolve git host');
+  }
+
+  if (addresses.length === 0) {
+    throw new Error('Could not resolve git host');
+  }
+
+  for (const { address, family } of addresses) {
+    if (family === 6 || address.includes(':')) {
+      assertNotPrivateIPv6(address.toLowerCase());
+    } else {
+      assertNotPrivateIPv4(address);
+    }
   }
 }
 
@@ -400,7 +453,8 @@ export async function cloneOrPull(
   // Always validate the requested URL — the prior shape only ran this in
   // the code path where the repo was cloned. Now it runs unconditionally,
   // preventing SSRF / blocked-host bypasses even when targetDir already exists.
-  validateGitUrl(url);
+  // validateGitUrl is async (it resolves DNS for non-IP hosts — D1), so await it.
+  await validateGitUrl(url);
 
   const exists = await fs.access(path.join(safeTarget, '.git')).then(
     () => true,
