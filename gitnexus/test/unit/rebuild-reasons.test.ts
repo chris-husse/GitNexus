@@ -303,6 +303,7 @@ const REBUILD_REASON_COVERAGE = [
   { key: 'spring-actuator', file: 'test/unit/incremental-orchestration.test.ts' },
   { key: 'asyncapi', file: 'test/unit/incremental-orchestration.test.ts' },
   { key: 'escalated-full-write', file: 'test/unit/incremental-orchestration.test.ts' },
+  { key: 'foreign-index', file: 'test/unit/run-analyze.test.ts' },
 ] as const satisfies readonly { readonly key: RebuildReasonKey; readonly file: string }[];
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');

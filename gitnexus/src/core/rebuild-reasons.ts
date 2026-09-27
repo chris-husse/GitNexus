@@ -34,6 +34,7 @@ export const REBUILD_REASON_KEYS = [
   'spring-actuator',
   'asyncapi',
   'escalated-full-write',
+  'foreign-index',
 ] as const;
 
 export type RebuildReasonKey = (typeof REBUILD_REASON_KEYS)[number];

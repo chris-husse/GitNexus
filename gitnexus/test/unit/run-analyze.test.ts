@@ -1,5 +1,6 @@
 import { execFileSync, execSync } from 'child_process';
 import fs from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { describe, it, expect, vi } from 'vitest';
@@ -1673,3 +1674,49 @@ describe('pdgModeMismatch / resolvePdgConfig (#2099 F1)', () => {
 // not here, so callers that only need this comparator (e.g. the MCP query
 // path) don't have to import the full analyze-pipeline module. run-analyze.ts
 // still imports and uses it (see the mismatch check above the early-return).
+
+describe('foreignIndexNotice (index copied from another checkout)', () => {
+  it('is silent when the recorded repoPath is the current one', async () => {
+    const { foreignIndexNotice } = await import('../../src/core/run-analyze.js');
+    const here = process.cwd();
+    expect(foreignIndexNotice(here, here)).toBeUndefined();
+  });
+
+  it('is silent when meta carries no repoPath (legacy meta)', async () => {
+    const { foreignIndexNotice } = await import('../../src/core/run-analyze.js');
+    expect(foreignIndexNotice(undefined, process.cwd())).toBeUndefined();
+    expect(foreignIndexNotice('', process.cwd())).toBeUndefined();
+  });
+
+  it('normalises trailing slashes and relative segments before comparing', async () => {
+    const { foreignIndexNotice } = await import('../../src/core/run-analyze.js');
+    const here = process.cwd();
+    expect(foreignIndexNotice(here + path.sep, here)).toBeUndefined();
+    expect(foreignIndexNotice(path.join(here, 'sub', '..'), here)).toBeUndefined();
+  });
+
+  it('resolves symlinks so an alias of the same checkout is not foreign', async () => {
+    const { foreignIndexNotice } = await import('../../src/core/run-analyze.js');
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-foreign-'));
+    try {
+      const real = path.join(base, 'real');
+      const link = path.join(base, 'link');
+      await fs.mkdir(real);
+      await fs.symlink(real, link, 'dir');
+      expect(foreignIndexNotice(link, real)).toBeUndefined();
+      expect(foreignIndexNotice(real, link)).toBeUndefined();
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('names both paths and announces the full rebuild when they differ', async () => {
+    const { foreignIndexNotice } = await import('../../src/core/run-analyze.js');
+    const recorded = '/Users/someone/Projects/app';
+    const here = process.cwd();
+    const notice = foreignIndexNotice(recorded, here);
+    expect(notice).toContain(recorded);
+    expect(notice).toContain(here);
+    expect(notice).toMatch(/full rebuild/i);
+  });
+});
