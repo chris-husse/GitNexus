@@ -707,14 +707,7 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
         lbugPath,
         llmConfig,
         continueOptions,
-        (phase, percent, detail) => {
-          const label = detail || phase;
-          if (label !== lastPhase) {
-            lastPhase = label;
-            phaseStart = Date.now();
-          }
-          bar.update(percent, { phase: label });
-        },
+        report,
       );
 
       const continueResult = await continueGenerator.run();
