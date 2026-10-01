@@ -118,6 +118,9 @@ export interface WikiRunResult {
 
 const DEFAULT_MAX_TOKENS_PER_MODULE = 30_000;
 const GROUPING_TOKEN_BUDGET = 100_000;
+// Heartbeat cadence while an LLM call is in flight (see invokeLLM). omc's
+// stall guard kills a silent child after 300 s; 30 s is a 10× margin.
+const HEARTBEAT_SECONDS = 30;
 const WIKI_DIR = 'wiki';
 
 // ─── Generator Class ──────────────────────────────────────────────────
@@ -153,11 +156,15 @@ export class WikiGenerator {
     const progressFn = onProgress || (() => {});
     this.onProgress = (phase, percent, detail) => {
       if (percent > 0) this.lastPercent = percent;
+      // The label a heartbeat repeats: the last real phase, never a stream
+      // token count and never a previous heartbeat.
+      if (phase !== 'heartbeat' && phase !== 'stream') this.lastLabel = detail || phase;
       progressFn(phase, percent, detail);
     };
   }
 
   private lastPercent = 0;
+  private lastLabel = '';
 
   /**
    * Create streaming options that report LLM progress to the progress bar.
@@ -223,9 +230,37 @@ export class WikiGenerator {
   }
 
   /**
-   * Route LLM call to the appropriate provider.
+   * Route one LLM call through the provider dispatch, heartbeating while it
+   * is in flight. While a model call runs — retries and backoff included —
+   * report onProgress('heartbeat', …) every HEARTBEAT_SECONDS so a piped
+   * parent (omc's stall guard) sees activity. Scoped to LLM calls on purpose:
+   * outside one, silence means a wedge the parent should catch; inside one,
+   * the request timeout (--timeout) bounds a hang. Same shape as the
+   * __wiki__ keepalive in run().
    */
   private async invokeLLM(
+    prompt: string,
+    systemPrompt: string,
+    options?: CallLLMOptions,
+  ): Promise<LLMResponse> {
+    const label = this.lastLabel;
+    let ticks = 0;
+    const heartbeat = setInterval(() => {
+      ticks += 1;
+      this.onProgress('heartbeat', this.lastPercent, `${label} (${ticks * HEARTBEAT_SECONDS}s)`);
+    }, HEARTBEAT_SECONDS * 1000);
+    heartbeat.unref?.();
+    try {
+      return await this.dispatchLLM(prompt, systemPrompt, options);
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
+  /**
+   * Route LLM call to the appropriate provider.
+   */
+  private async dispatchLLM(
     prompt: string,
     systemPrompt: string,
     options?: CallLLMOptions,
