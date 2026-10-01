@@ -22,7 +22,8 @@ import {
   StorageRequirementError,
   isUnusableIndexInspection,
 } from '../storage/storage-resolver.js';
-import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
+import { WikiGenerator, type WikiOptions, type ProgressCallback } from '../core/wiki/generator.js';
+import { makeProgressLineWriter } from './wiki-progress.js';
 import {
   MINIMAX_MODEL_IDS,
   MINIMAX_OPENAI_BASE_URLS,
@@ -595,20 +596,31 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
     lang: options?.lang,
   };
 
+  // Piped stderr (omc, CI, redirected logs): cli-progress renders nothing off
+  // a TTY, so report one GITNEXUS_PROGRESS JSON line per change instead. The
+  // bar, its start/stop and the elapsed timer stay as they are — cli-progress
+  // already makes them no-ops off a TTY.
+  const piped = process.stderr.isTTY !== true;
+  const report: ProgressCallback = piped
+    ? makeProgressLineWriter((line) => {
+        process.stderr.write(line + '\n');
+      })
+    : (phase, percent, detail) => {
+        const label = detail || phase;
+        if (label !== lastPhase) {
+          lastPhase = label;
+          phaseStart = Date.now();
+        }
+        bar.update(percent, { phase: label });
+      };
+
   const generator = new WikiGenerator(
     repoPath,
     storagePath,
     lbugPath,
     llmConfig,
     wikiOptions,
-    (phase, percent, detail) => {
-      const label = detail || phase;
-      if (label !== lastPhase) {
-        lastPhase = label;
-        phaseStart = Date.now();
-      }
-      bar.update(percent, { phase: label });
-    },
+    report,
   );
 
   try {
