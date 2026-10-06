@@ -33,6 +33,7 @@ describe('WikiGenerator heartbeat', () => {
       initWikiDb: vi.fn().mockResolvedValue(undefined),
       closeWikiDb: vi.fn().mockResolvedValue(undefined),
       touchWikiDb: vi.fn(),
+      pinWikiDb: vi.fn(() => vi.fn()),
       getFilesWithExports: vi
         .fn()
         .mockResolvedValue([{ filePath: 'src/a.ts', symbols: [{ name: 'a', type: 'function' }] }]),
@@ -52,12 +53,17 @@ describe('WikiGenerator heartbeat', () => {
 
     const llmClient = await import('../../src/core/wiki/llm-client.js');
     // Buffered provider simulation: nothing streams; the answer lands after 6 min.
-    const callLLMSpy = vi.spyOn(llmClient, 'callLLM').mockImplementation(
-      () =>
-        new Promise((resolve) =>
-          setTimeout(() => resolve({ content: JSON.stringify({ All: ['src/a.ts'] }) }), SLOW_LLM_MS),
-        ),
-    );
+    const callLLMSpy = vi
+      .spyOn(llmClient, 'callLLM')
+      .mockImplementation(
+        () =>
+          new Promise((resolve) =>
+            setTimeout(
+              () => resolve({ content: JSON.stringify({ All: ['src/a.ts'] }) }),
+              SLOW_LLM_MS,
+            ),
+          ),
+      );
 
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
     const storagePath = path.join(tmpDir, 'storage');

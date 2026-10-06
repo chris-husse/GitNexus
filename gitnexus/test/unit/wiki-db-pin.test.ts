@@ -57,6 +57,10 @@ describe('WikiGenerator DB pinning', () => {
       path.join(storagePath, 'wiki', 'module_tree.json'),
       JSON.stringify([{ name: 'Core', slug: 'core', files: ['src/index.ts'] }]),
     );
+    // module_tree.json is honoured only while a --review stop is pending (see
+    // buildModuleTree); the marker keeps this run on the pre-seeded tree so it
+    // never reaches the LLM.
+    await fs.writeFile(path.join(storagePath, 'wiki', 'module_tree.review-pending'), '');
 
     initWikiDbMock.mockResolvedValue(undefined);
     closeWikiDbMock.mockResolvedValue(undefined);
