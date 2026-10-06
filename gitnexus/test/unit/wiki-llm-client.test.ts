@@ -677,7 +677,33 @@ describe('readSSEStream — completion cap diagnosis', () => {
         '{"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}',
         '{"choices":[{"delta":{},"finish_reason":"length"}]}',
       ]),
-    ).resolves.toEqual({ content: 'partial' });
+    ).resolves.toEqual({ content: 'partial', finishReason: 'length' });
+  });
+
+  it('reports the finish reason of a non-streaming response', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: 'hello' }, finish_reason: 'stop' }],
+            usage: {},
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    );
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(
+      callLLM('test', {
+        apiKey: 'key',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'test',
+        maxTokens: 100,
+        temperature: 0,
+        provider: 'openai',
+      }),
+    ).resolves.toMatchObject({ content: 'hello', finishReason: 'stop' });
   });
 });
 
