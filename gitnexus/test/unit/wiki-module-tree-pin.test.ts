@@ -72,6 +72,7 @@ describe('buildModuleTree does not reuse a stale module_tree.json', () => {
       initWikiDb: vi.fn().mockResolvedValue(undefined),
       closeWikiDb: vi.fn().mockResolvedValue(undefined),
       touchWikiDb: vi.fn(),
+      pinWikiDb: vi.fn(() => vi.fn()),
       getFilesWithExports: vi.fn().mockResolvedValue(files),
       getAllFiles: vi.fn().mockResolvedValue(files.map((f) => f.filePath)),
       getIntraModuleCallEdges: vi.fn().mockResolvedValue([]),
