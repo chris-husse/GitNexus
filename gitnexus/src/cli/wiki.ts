@@ -720,7 +720,9 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
       console.log(`  Mode: ${continueResult.mode}`);
       console.log(`  Pages: ${continueResult.pagesGenerated}`);
       if (result.groupingFallback || continueResult.groupingFallback) {
-        console.log(`  Grouping fallback: ${result.groupingFallback ?? continueResult.groupingFallback}`);
+        console.log(
+          `  Grouping fallback: ${result.groupingFallback ?? continueResult.groupingFallback}`,
+        );
       }
       console.log(`  Output: ${wikiDir}`);
       console.log(`  Viewer: ${viewerPath}`);

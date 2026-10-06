@@ -103,7 +103,9 @@ describe('resolveLLMConfig provider isolation', () => {
   });
 
   it('does not use OpenAI environment credentials for the default MiniMax provider', async () => {
-    vi.spyOn(await import('../../src/storage/repo-manager.js'), 'loadCLIConfig').mockResolvedValue({});
+    vi.spyOn(await import('../../src/storage/repo-manager.js'), 'loadCLIConfig').mockResolvedValue(
+      {},
+    );
     vi.stubEnv('OPENAI_API_KEY', 'openai-key');
     vi.stubEnv('GITNEXUS_API_KEY', 'gitnexus-key');
     vi.stubEnv('MINIMAX_API_KEY', '');
@@ -623,38 +625,59 @@ describe('readSSEStream — completion cap diagnosis', () => {
     const encoder = new TextEncoder();
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(encoder.encode(events.map((event) => `data: ${event}\n\n`).join('') + 'data: [DONE]\n\n'));
+        controller.enqueue(
+          encoder.encode(events.map((event) => `data: ${event}\n\n`).join('') + 'data: [DONE]\n\n'),
+        );
         controller.close();
       },
     });
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, {
-      status: 200, headers: { 'Content-Type': 'text/event-stream' },
-    })));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        }),
+      ),
+    );
     const { callLLM } = await import('../../src/core/wiki/llm-client.js');
-    return callLLM('test', {
-      apiKey: 'key', baseUrl: 'https://api.openai.com/v1', model: 'test',
-      maxTokens, temperature: 0, provider: 'openai',
-    }, undefined, { onChunk: () => {} });
+    return callLLM(
+      'test',
+      {
+        apiKey: 'key',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'test',
+        maxTokens,
+        temperature: 0,
+        provider: 'openai',
+      },
+      undefined,
+      { onChunk: () => {} },
+    );
   }
 
   it('names max_completion_tokens when length has no visible content', async () => {
-    await expect(streamResponse([
-      '{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
-      '{"choices":[{"delta":{},"finish_reason":"length"}]}',
-    ])).rejects.toThrow('no visible text before reaching max_completion_tokens (321)');
+    await expect(
+      streamResponse([
+        '{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+        '{"choices":[{"delta":{},"finish_reason":"length"}]}',
+      ]),
+    ).rejects.toThrow('no visible text before reaching max_completion_tokens (321)');
   });
 
   it('keeps the generic error for an empty stop response', async () => {
-    await expect(streamResponse([
-      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
-    ])).rejects.toThrow('LLM returned empty streaming response');
+    await expect(
+      streamResponse(['{"choices":[{"delta":{},"finish_reason":"stop"}]}']),
+    ).rejects.toThrow('LLM returned empty streaming response');
   });
 
   it('returns visible content despite a length finish reason', async () => {
-    await expect(streamResponse([
-      '{"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}',
-      '{"choices":[{"delta":{},"finish_reason":"length"}]}',
-    ])).resolves.toEqual({ content: 'partial' });
+    await expect(
+      streamResponse([
+        '{"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}',
+        '{"choices":[{"delta":{},"finish_reason":"length"}]}',
+      ]),
+    ).resolves.toEqual({ content: 'partial' });
   });
 });
 
