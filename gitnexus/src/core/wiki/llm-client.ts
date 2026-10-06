@@ -77,6 +77,8 @@ export interface LLMResponse {
   content: string;
   promptTokens?: number;
   completionTokens?: number;
+  /** The provider's finish_reason when it reports one; 'length' means the answer was cut at max_completion_tokens. */
+  finishReason?: string;
 }
 
 export function resolveMiniMaxThinkingMode(
@@ -464,6 +466,7 @@ export async function callLLM(
     content: choice.message.content,
     promptTokens: json.usage?.prompt_tokens,
     completionTokens: json.usage?.completion_tokens,
+    finishReason: choice.finish_reason ?? undefined,
   };
 }
 
@@ -534,5 +537,5 @@ async function readSSEStream(
     throw new Error('LLM returned empty streaming response');
   }
 
-  return { content };
+  return { content, finishReason };
 }

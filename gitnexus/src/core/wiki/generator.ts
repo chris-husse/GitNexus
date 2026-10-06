@@ -119,7 +119,12 @@ export interface WikiRunResult {
 
 const DEFAULT_MAX_TOKENS_PER_MODULE = 30_000;
 const GROUPING_TOKEN_BUDGET = 100_000;
-const GROUPING_OUTPUT_BUDGET_DIVISOR = 4;
+// Visible-answer budget per grouping call. Reasoning tokens also count against
+// max_completion_tokens but never show up in the stream: on Sonnet 5 they ran
+// two to three times the visible answer, and the chars/4 estimate undercounts
+// path-heavy JSON by about 1.6x, so a quarter of the cap truncated live batches.
+// An eighth leaves the rest for reasoning; groupBatch recovers when it does not.
+const GROUPING_OUTPUT_BUDGET_DIVISOR = 8;
 // Heartbeat cadence while an LLM call is in flight (see invokeLLM). omc's
 // stall guard kills a silent child after 300 s; 30 s is a 10× margin.
 const HEARTBEAT_SECONDS = 30;
@@ -571,33 +576,8 @@ export class WikiGenerator {
 
     this.onProgress('grouping', 15, 'Grouping files into modules (LLM)...');
 
-    const fileList = formatFileListForGrouping(files);
-    const dirTree = formatDirectoryTree(files.map((f) => f.filePath));
-
-    const prompt = fillTemplate(GROUPING_USER_PROMPT, {
-      FILE_LIST: fileList,
-      DIRECTORY_TREE: dirTree,
-    });
-
-    let grouping: Record<string, string[]>;
-
-    if (this.groupingFits(files)) {
-      // Grouping is a structured-data phase (JSON output), not documentation.
-      // Do NOT apply buildSystemPrompt here — a language instruction would risk
-      // translating module-name keys, breaking slug stability and JSON parsing.
-      try {
-        const response = await this.invokeLLM(
-          prompt,
-          GROUPING_SYSTEM_PROMPT,
-          this.streamOpts('Grouping files', 15, 13),
-        );
-        grouping = this.parseGroupingResponse(response.content, files);
-      } catch (error) {
-        grouping = this.fallbackGrouping(files, this.groupingErrorReason(error));
-      }
-    } else {
-      grouping = await this.batchedGrouping(files);
-    }
+    const batches = this.groupingFits(files) ? [files] : this.batchFilesForGrouping(files);
+    const grouping = await this.groupInBatches(files, batches);
 
     // Convert to tree nodes
     const tree: ModuleTreeNode[] = [];
@@ -629,36 +609,31 @@ export class WikiGenerator {
   }
 
   /**
-   * Run grouping in batches when the full request or estimated answer exceeds its budget.
+   * Group every batch with the LLM and merge the answers. A single fitting
+   * batch is the whole file list. A thrown LLM error abandons all partial
+   * answers for directory grouping; a truncated answer is handled per batch
+   * by groupBatch.
    */
-  private async batchedGrouping(files: FileWithExports[]): Promise<Record<string, string[]>> {
-    const batches = this.batchFilesForGrouping(files);
+  private async groupInBatches(
+    files: FileWithExports[],
+    batches: FileWithExports[][],
+  ): Promise<Record<string, string[]>> {
     const partials: Record<string, string[]>[] = [];
+    const single = batches.length === 1;
 
     for (let i = 0; i < batches.length; i++) {
-      const batch = batches[i];
-      this.onProgress(
-        'grouping',
-        15 + Math.round(((i + 1) / batches.length) * 13),
-        `Grouping batch ${i + 1}/${batches.length} (LLM)...`,
-      );
-
-      const batchFileList = formatFileListForGrouping(batch);
-      const batchDirTree = formatDirectoryTree(batch.map((f) => f.filePath));
-      const batchPrompt = fillTemplate(GROUPING_USER_PROMPT, {
-        FILE_LIST: batchFileList,
-        DIRECTORY_TREE: batchDirTree,
-      });
-
-      try {
-        const batchStart = 15 + Math.round((i / batches.length) * 13);
-        const batchRange = Math.max(1, Math.round(13 / batches.length));
-        const response = await this.invokeLLM(
-          batchPrompt,
-          GROUPING_SYSTEM_PROMPT,
-          this.streamOpts(`Grouping batch ${i + 1}/${batches.length}`, batchStart, batchRange),
+      const label = single ? 'Grouping files' : `Grouping batch ${i + 1}/${batches.length}`;
+      if (!single) {
+        this.onProgress(
+          'grouping',
+          15 + Math.round(((i + 1) / batches.length) * 13),
+          `${label} (LLM)...`,
         );
-        partials.push(this.parseGroupingResponse(response.content, batch));
+      }
+      try {
+        const start = 15 + Math.round((i / batches.length) * 13);
+        const range = Math.max(1, Math.round(13 / batches.length));
+        partials.push(await this.groupBatch(batches[i], label, start, range));
       } catch (error) {
         return this.fallbackGrouping(files, this.groupingErrorReason(error));
       }
@@ -675,6 +650,57 @@ export class WikiGenerator {
     return Object.keys(merged).length > 0
       ? merged
       : this.fallbackGrouping(files, 'empty grouping response');
+  }
+
+  /**
+   * One grouping call. Grouping is a structured-data phase (JSON output), not
+   * documentation: buildSystemPrompt is NOT applied, since a language
+   * instruction could translate module-name keys and break slug stability.
+   *
+   * finish_reason 'length' means the answer was cut at max_completion_tokens.
+   * The output estimate cannot see reasoning tokens, so a truncated batch was
+   * simply too big for this model: regroup it as two halves instead of
+   * discarding the LLM grouping. One file that still truncates falls back for
+   * itself only.
+   */
+  private async groupBatch(
+    batch: FileWithExports[],
+    label: string,
+    startPercent: number,
+    percentRange: number,
+  ): Promise<Record<string, string[]>> {
+    const prompt = fillTemplate(GROUPING_USER_PROMPT, {
+      FILE_LIST: formatFileListForGrouping(batch),
+      DIRECTORY_TREE: formatDirectoryTree(batch.map((f) => f.filePath)),
+    });
+    const response = await this.invokeLLM(
+      prompt,
+      GROUPING_SYSTEM_PROMPT,
+      this.streamOpts(label, startPercent, percentRange),
+    );
+    if (response.finishReason !== 'length') {
+      return this.parseGroupingResponse(response.content, batch, response.finishReason);
+    }
+
+    const cap = `max_completion_tokens (${this.llmConfig.maxTokens})`;
+    if (batch.length === 1) {
+      return this.fallbackGrouping(batch, `answer for 1 file hit ${cap}`);
+    }
+    this.onProgress(
+      'grouping',
+      startPercent,
+      `${label}: answer for ${batch.length} files hit ${cap}, regrouping as two halves`,
+    );
+    const half = Math.ceil(batch.length / 2);
+    const halfRange = Math.max(1, Math.round(percentRange / 2));
+    const first = await this.groupBatch(batch.slice(0, half), `${label}a`, startPercent, halfRange);
+    const second = await this.groupBatch(
+      batch.slice(half),
+      `${label}b`,
+      startPercent + halfRange,
+      halfRange,
+    );
+    return this.mergeGroupings([first, second]);
   }
 
   /**
@@ -837,6 +863,7 @@ export class WikiGenerator {
   private parseGroupingResponse(
     content: string,
     files: FileWithExports[],
+    finishReason?: string,
   ): Record<string, string[]> {
     // Extract JSON from response (handle markdown fences)
     let jsonStr = content.trim();
@@ -849,8 +876,12 @@ export class WikiGenerator {
     try {
       parsed = JSON.parse(jsonStr);
     } catch {
-      // Fallback: group by top-level directory
-      return this.fallbackGrouping(files, 'invalid grouping JSON');
+      // Fallback: group by top-level directory. Name what came back so a
+      // truncated-but-unreported answer and a malformed one stay distinguishable.
+      return this.fallbackGrouping(
+        files,
+        `invalid grouping JSON (finish_reason=${finishReason ?? 'unknown'}, ${content.length} chars)`,
+      );
     }
 
     if (typeof parsed !== 'object' || Array.isArray(parsed)) {

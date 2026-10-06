@@ -95,6 +95,26 @@ describe('batchFilesForGrouping', () => {
     expect((gen as any).estimateGroupingOutputTokens(files)).toBe(10);
   });
 
+  it('keeps the estimated answer within an eighth of the completion cap', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'openai',
+    });
+    // 40 short paths estimate to 160 output tokens: under a quarter of the cap (250),
+    // over an eighth (125). Live Sonnet 5 batches showed invisible reasoning tokens
+    // of two to three times the visible answer, so a quarter left no headroom.
+    const files = makeFiles(40, 'src', 0);
+    const estimate = (gen as any).estimateGroupingOutputTokens(files);
+    expect(estimate).toBeGreaterThan(125);
+    expect(estimate).toBeLessThanOrEqual(250);
+    expect((gen as any).groupingFits(files)).toBe(false);
+  });
+
   it('splits output-heavy files using the configured completion cap and keeps every path', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
     const files = [...makeFiles(80, 'src'), { filePath: 'win\\quoted".ts', symbols: [] }];
@@ -107,8 +127,8 @@ describe('batchFilesForGrouping', () => {
         temperature: 0,
         provider: 'openai',
       });
-    const tight = makeGenerator(1000); // output budget = 250 tokens
-    const roomy = makeGenerator(4000); // output budget = 1000 tokens
+    const tight = makeGenerator(1000); // output budget = 125 tokens
+    const roomy = makeGenerator(4000); // output budget = 500 tokens
     expect((tight as any).estimateGroupingPromptTokens(files)).toBeLessThan(100_000);
     const batches = (tight as any).batchFilesForGrouping(files);
     expect(batches.length).toBeGreaterThan(1);
@@ -784,5 +804,152 @@ describe('buildModuleTree batched grouping', () => {
       n.children ? n.children.flatMap((c: any) => c.files) : n.files,
     );
     expect(allFiles.length).toBe(fakeFiles.length);
+  });
+});
+
+// ─── buildModuleTree truncation recovery ───────────────────────────
+
+describe('buildModuleTree truncation recovery', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wiki-truncation-test-'));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  const config = {
+    apiKey: '',
+    baseUrl: '',
+    model: 'test',
+    maxTokens: 1000,
+    temperature: 0,
+    provider: 'openai' as const,
+  };
+
+  function promptFiles(prompt: string): string[] {
+    const found: string[] = [];
+    const re = /^- ([^\s:]+):/gm;
+    let match;
+    while ((match = re.exec(prompt)) !== null) found.push(match[1]);
+    return found;
+  }
+
+  async function makeGen(storageName: string, events: string[]) {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const storagePath = path.join(tmpDir, storageName);
+    await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
+    const gen = new WikiGenerator(
+      '/repo',
+      storagePath,
+      '/lbug',
+      config,
+      {},
+      (_phase, _pct, detail) => events.push(detail ?? ''),
+    );
+    vi.spyOn(gen as any, 'estimateModuleTokens').mockResolvedValue(0);
+    return gen;
+  }
+
+  it('regroups a truncated batch as two halves instead of falling back', async () => {
+    const files = Array.from({ length: 81 }, (_, i) => ({
+      filePath: `src/file${i}.ts`,
+      symbols: [],
+    }));
+    const events: string[] = [];
+    const gen = await makeGen('halves', events);
+    let calls = 0;
+    const invoke = vi.spyOn(gen as any, 'invokeLLM').mockImplementation(async (prompt: string) => {
+      calls++;
+      const listed = promptFiles(prompt);
+      if (listed.length > 12) {
+        // Completion cap hit mid-answer: a valid prefix cut inside a string.
+        const partial = JSON.stringify({ Cut: listed.slice(0, 3) }).slice(0, -6);
+        return { content: partial, finishReason: 'length' };
+      }
+      return { content: JSON.stringify({ [`Module${calls}`]: listed }), finishReason: 'stop' };
+    });
+    const batchCount = (gen as any).batchFilesForGrouping(files).length;
+
+    const tree = await (gen as any).buildModuleTree(files);
+
+    expect(batchCount).toBeGreaterThan(1);
+    expect(invoke.mock.calls.length).toBeGreaterThan(batchCount);
+    const names = tree.map((node: any) => node.name);
+    expect(names).not.toContain('Cut');
+    expect(names).not.toContain('Other');
+    expect([...tree.flatMap((node: any) => node.files)].sort()).toEqual(
+      files.map((f) => f.filePath).sort(),
+    );
+    expect((gen as any).groupingFallback).toBeUndefined();
+    expect(events.some((event) => event.includes('falling back'))).toBe(false);
+    expect(
+      events.some(
+        (event) => event.includes('max_completion_tokens (1000)') && event.includes('halves'),
+      ),
+    ).toBe(true);
+  });
+
+  it('recovers a truncated single-prompt answer the same way', async () => {
+    const files = [
+      { filePath: 'src/a.ts', symbols: [] },
+      { filePath: 'src/b.ts', symbols: [] },
+    ];
+    const events: string[] = [];
+    const gen = await makeGen('single', events);
+    expect((gen as any).groupingFits(files)).toBe(true);
+    let calls = 0;
+    vi.spyOn(gen as any, 'invokeLLM').mockImplementation(async (prompt: string) => {
+      calls++;
+      const listed = promptFiles(prompt);
+      if (listed.length > 1)
+        return { content: '{"Both": ["src/a.ts", "sr', finishReason: 'length' };
+      return { content: JSON.stringify({ [`Module${calls}`]: listed }), finishReason: 'stop' };
+    });
+
+    const tree = await (gen as any).buildModuleTree(files);
+
+    expect(calls).toBe(3);
+    expect(tree.map((node: any) => node.name).sort()).toEqual(['Module2', 'Module3']);
+    expect((gen as any).groupingFallback).toBeUndefined();
+    expect(events.some((event) => event.includes('falling back'))).toBe(false);
+  });
+
+  it('falls back for one file whose answer still hits the cap, naming the cap', async () => {
+    const events: string[] = [];
+    const gen = await makeGen('singleton', events);
+    vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({
+      content: '{"A": ["al',
+      finishReason: 'length',
+    });
+
+    const tree = await (gen as any).buildModuleTree([{ filePath: 'alpha/a.ts', symbols: [] }]);
+
+    expect(tree.map((node: any) => node.name)).toEqual(['alpha']);
+    expect((gen as any).groupingFallback).toBe(
+      'answer for 1 file hit max_completion_tokens (1000)',
+    );
+    expect(events).toContain(
+      'Grouping failed (answer for 1 file hit max_completion_tokens (1000)), falling back to directory grouping',
+    );
+  });
+
+  it('names the finish reason and size when grouping JSON is malformed', async () => {
+    const events: string[] = [];
+    const gen = await makeGen('malformed-reason', events);
+    vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({
+      content: '{broken',
+      finishReason: 'stop',
+    });
+
+    await (gen as any).buildModuleTree([{ filePath: 'alpha/a.ts', symbols: [] }]);
+
+    expect((gen as any).groupingFallback).toBe(
+      'invalid grouping JSON (finish_reason=stop, 7 chars)',
+    );
   });
 });
