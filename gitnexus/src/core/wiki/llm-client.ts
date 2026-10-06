@@ -450,7 +450,7 @@ export async function callLLM(
 
   // Streaming path
   if (useStream && response.body) {
-    return await readSSEStream(response.body, options!.onChunk!);
+    return await readSSEStream(response.body, options!.onChunk!, config.maxTokens);
   }
 
   // Non-streaming path
@@ -473,12 +473,14 @@ export async function callLLM(
 async function readSSEStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (charsReceived: number) => void,
+  maxCompletionTokens: number,
 ): Promise<LLMResponse> {
   const decoder = new TextDecoder();
   const reader = body.getReader();
   let content = '';
   let buffer = '';
   let contentFilterTriggered = false;
+  let finishReason: string | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -497,6 +499,8 @@ async function readSSEStream(
       try {
         const parsed = JSON.parse(data);
         const choice = parsed.choices?.[0];
+
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
 
         // Detect content filter finish reason — skip delta from this chunk
         if (choice?.finish_reason === 'content_filter') {
@@ -522,6 +526,11 @@ async function readSSEStream(
   }
 
   if (!content) {
+    if (finishReason === 'length') {
+      throw new Error(
+        `LLM returned no visible text before reaching max_completion_tokens (${maxCompletionTokens})`,
+      );
+    }
     throw new Error('LLM returned empty streaming response');
   }
 

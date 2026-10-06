@@ -75,6 +75,95 @@ describe('batchFilesForGrouping', () => {
     expect(batches).toHaveLength(0);
   });
 
+  it('estimates quoted output paths, including JSON escapes, without extra allowance', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'openai',
+    });
+    const files = [
+      { filePath: 'a.ts', symbols: [] },
+      { filePath: 'src/a.ts', symbols: [] },
+      { filePath: 'win\\quoted".ts', symbols: [] },
+    ];
+    // JSON entries are "a.ts", (2 tokens), "src/a.ts", (3), and
+    // "win\\\\quoted\\".ts", (5) under the existing four-chars heuristic.
+    expect((gen as any).estimateGroupingOutputTokens(files)).toBe(10);
+  });
+
+  it('splits output-heavy files using the configured completion cap and keeps every path', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const files = [...makeFiles(80, 'src'), { filePath: 'win\\quoted".ts', symbols: [] }];
+    const makeGenerator = (maxTokens: number) =>
+      new WikiGenerator('/repo', tmpDir, '/lbug', {
+        apiKey: '',
+        baseUrl: '',
+        model: 'test',
+        maxTokens,
+        temperature: 0,
+        provider: 'openai',
+      });
+    const tight = makeGenerator(1000); // output budget = 250 tokens
+    const roomy = makeGenerator(4000); // output budget = 1000 tokens
+    expect((tight as any).estimateGroupingPromptTokens(files)).toBeLessThan(100_000);
+    const batches = (tight as any).batchFilesForGrouping(files);
+    expect(batches.length).toBeGreaterThan(1);
+    expect((roomy as any).batchFilesForGrouping(files)).toHaveLength(1);
+    expect(batches.flat().map((f: any) => f.filePath)).toEqual(files.map((f) => f.filePath));
+    for (const batch of batches) {
+      expect((tight as any).groupingFits(batch)).toBe(true);
+    }
+  });
+
+  it('terminates with an indivisible output-heavy path still present', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 16,
+      temperature: 0,
+      provider: 'openai',
+    });
+    const files = [{ filePath: `src/${'x'.repeat(80)}.ts`, symbols: [] }];
+    expect((gen as any).groupingFits(files)).toBe(false);
+    expect((gen as any).batchFilesForGrouping(files)).toEqual([files]);
+  });
+
+  it('trims an input-heavy singleton even when its path exceeds the output budget', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 16,
+      temperature: 0,
+      provider: 'openai',
+    });
+    const filePath = `src/${'x'.repeat(80)}.ts`;
+    const file = {
+      filePath,
+      symbols: Array.from({ length: 10_000 }, (_, i) => ({
+        name: `veryLongExportedSymbolName_${i}_padding`,
+        type: 'function',
+      })),
+    };
+    expect((gen as any).estimateGroupingPromptTokens([file])).toBeGreaterThan(100_000);
+
+    const batches = (gen as any).batchFilesForGrouping([file]);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0][0].filePath).toBe(filePath);
+    expect(batches[0][0].symbols.length).toBeLessThan(file.symbols.length);
+    expect(batches[0][0].symbols.at(-1)?.type).toBe('truncated');
+    expect((gen as any).estimateGroupingPromptTokens(batches[0])).toBeLessThanOrEqual(100_000);
+    expect((gen as any).groupingFits(batches[0])).toBe(false);
+  });
+
   it('splits into multiple batches when files exceed budget', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
 
@@ -97,8 +186,11 @@ describe('batchFilesForGrouping', () => {
 
     const batches = (gen as any).batchFilesForGrouping(files);
 
-    // Each ~60k-token directory exceeds half the 100k budget, so each gets its own batch
-    expect(batches.length).toBe(4);
+    // The input budget separates directories; the output cap also splits each directory.
+    expect(batches.length).toBeGreaterThan(4);
+    for (const batch of batches) {
+      expect((gen as any).groupingFits(batch)).toBe(true);
+    }
 
     // Every input file appears in exactly one batch
     const allBatchedFiles = batches.flat().map((f: any) => f.filePath);
@@ -406,6 +498,112 @@ describe('buildModuleTree batched grouping', () => {
     expect(result.moduleTree!.length).toBe(2);
   });
 
+  it('uses multiple LLM calls when only the estimated answer exceeds the cap', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const storagePath = path.join(tmpDir, 'output-heavy');
+    await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
+    const files = Array.from({ length: 80 }, (_, i) => ({
+      filePath: `src/file${i}.ts`,
+      symbols: [],
+    }));
+    files.push({ filePath: 'win\\quoted".ts', symbols: [] });
+    const gen = new WikiGenerator('/repo', storagePath, '/lbug', {
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'openai',
+    });
+    vi.spyOn(gen as any, 'estimateModuleTokens').mockResolvedValue(0);
+    const invoke = vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({ content: '{}' });
+
+    const tree = await (gen as any).buildModuleTree(files);
+
+    expect(invoke.mock.calls.length).toBeGreaterThan(1);
+    expect(tree.flatMap((node: any) => node.files)).toEqual(files.map((f) => f.filePath));
+  });
+
+  it('falls back after a single grouping failure and returns the reason', async () => {
+    const files = [
+      { filePath: 'alpha/a.ts', symbols: [] },
+      { filePath: 'beta/b.ts', symbols: [] },
+    ];
+    vi.doMock('../../src/core/wiki/graph-queries.js', () => ({
+      initWikiDb: vi.fn().mockResolvedValue(undefined),
+      closeWikiDb: vi.fn().mockResolvedValue(undefined),
+      touchWikiDb: vi.fn(),
+      pinWikiDb: vi.fn(() => vi.fn()),
+      getFilesWithExports: vi.fn().mockResolvedValue(files),
+      getAllFiles: vi.fn().mockResolvedValue(files.map((f) => f.filePath)),
+    }));
+    vi.doMock('child_process', () => ({
+      execSync: vi.fn().mockImplementation(() => {
+        throw new Error('not a git repo');
+      }),
+      execFileSync: vi.fn(),
+    }));
+    const llmClient = await import('../../src/core/wiki/llm-client.js');
+    vi.spyOn(llmClient, 'callLLM').mockRejectedValue(new Error('completion exhausted'));
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const storagePath = path.join(tmpDir, 'single-failure');
+    await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
+    const events: string[] = [];
+    const gen = new WikiGenerator(
+      '/repo',
+      storagePath,
+      '/lbug',
+      {
+        apiKey: 'key',
+        baseUrl: 'http://localhost',
+        model: 'test',
+        maxTokens: 1000,
+        temperature: 0,
+        provider: 'openai',
+      },
+      { reviewOnly: true },
+      (_phase, _percent, detail) => events.push(detail ?? ''),
+    );
+
+    const result = await gen.run();
+
+    expect(result.moduleTree?.map((node) => node.name)).toEqual(['alpha', 'beta']);
+    expect(result.groupingFallback).toBe('completion exhausted');
+    expect(events).toContain(
+      'Grouping failed (completion exhausted), falling back to directory grouping',
+    );
+  });
+
+  it('reports malformed grouping output as a visible fallback', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const storagePath = path.join(tmpDir, 'malformed');
+    await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
+    const events: string[] = [];
+    const gen = new WikiGenerator(
+      '/repo',
+      storagePath,
+      '/lbug',
+      {
+        apiKey: '',
+        baseUrl: '',
+        model: 'test',
+        maxTokens: 1000,
+        temperature: 0,
+        provider: 'openai',
+      },
+      {},
+      (_phase, _percent, detail) => events.push(detail ?? ''),
+    );
+    vi.spyOn(gen as any, 'estimateModuleTokens').mockResolvedValue(0);
+    vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({ content: '{broken' });
+
+    const tree = await (gen as any).buildModuleTree([{ filePath: 'alpha/a.ts', symbols: [] }]);
+
+    expect(tree.map((node: any) => node.name)).toEqual(['alpha']);
+    expect((gen as any).groupingFallback).toMatch(/invalid grouping JSON/i);
+    expect(events.some((event) => event.includes('falling back to directory grouping'))).toBe(true);
+  });
+
   it('uses multiple LLM calls for oversized file lists and merges results', async () => {
     // Generate enough files to exceed the 100k token budget
     const dirs = ['alpha', 'beta', 'gamma', 'delta'];
@@ -484,8 +682,8 @@ describe('buildModuleTree batched grouping', () => {
 
     const result = await gen.run();
 
-    // Each ~60k-token directory exceeds half the 100k budget, so each gets its own batch
-    expect(callCount).toBe(4);
+    // The completion cap subdivides these already input-heavy directories.
+    expect(callCount).toBeGreaterThan(4);
     expect(result.moduleTree).toBeDefined();
 
     // All 600 files should be accounted for
@@ -548,6 +746,7 @@ describe('buildModuleTree batched grouping', () => {
     await fs.mkdir(wikiDir, { recursive: true });
     await fs.mkdir(repoPath, { recursive: true });
 
+    const events: string[] = [];
     const gen = new WikiGenerator(
       repoPath,
       storagePath,
@@ -561,6 +760,7 @@ describe('buildModuleTree batched grouping', () => {
         provider: 'openai',
       },
       { reviewOnly: true },
+      (_phase, _percent, detail) => events.push(detail ?? ''),
     );
 
     const result = await gen.run();
@@ -576,6 +776,8 @@ describe('buildModuleTree batched grouping', () => {
     // First batch's LLM result ('SomeModule') must NOT leak through — nuclear fallback
     // discards all partial results
     expect(moduleNames).not.toContain('SomeModule');
+    expect(result.groupingFallback).toBe('LLM API error');
+    expect(events).toContain('Grouping failed (LLM API error), falling back to directory grouping');
 
     // All files still accounted for
     const allFiles = result.moduleTree!.flatMap((n: any) =>
