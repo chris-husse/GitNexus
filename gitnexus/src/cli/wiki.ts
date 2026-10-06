@@ -719,6 +719,9 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
       console.log(`\n  Wiki generated successfully (${totalElapsed}s)\n`);
       console.log(`  Mode: ${continueResult.mode}`);
       console.log(`  Pages: ${continueResult.pagesGenerated}`);
+      if (result.groupingFallback || continueResult.groupingFallback) {
+        console.log(`  Grouping fallback: ${result.groupingFallback ?? continueResult.groupingFallback}`);
+      }
       console.log(`  Output: ${wikiDir}`);
       console.log(`  Viewer: ${viewerPath}`);
 
@@ -746,6 +749,9 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
     console.log(`\n  Wiki generated successfully (${elapsed}s)\n`);
     console.log(`  Mode: ${result.mode}`);
     console.log(`  Pages: ${result.pagesGenerated}`);
+    if (result.groupingFallback) {
+      console.log(`  Grouping fallback: ${result.groupingFallback}`);
+    }
     console.log(`  Output: ${wikiDir}`);
     console.log(`  Viewer: ${viewerPath}`);
 

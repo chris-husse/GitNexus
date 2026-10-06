@@ -112,12 +112,14 @@ export interface WikiRunResult {
   mode: 'full' | 'incremental' | 'up-to-date';
   failedModules: string[];
   moduleTree?: ModuleTreeNode[];
+  groupingFallback?: string;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_TOKENS_PER_MODULE = 30_000;
 const GROUPING_TOKEN_BUDGET = 100_000;
+const GROUPING_OUTPUT_BUDGET_DIVISOR = 4;
 // Heartbeat cadence while an LLM call is in flight (see invokeLLM). omc's
 // stall guard kills a silent child after 300 s; 30 s is a 10× margin.
 const HEARTBEAT_SECONDS = 30;
@@ -136,6 +138,7 @@ export class WikiGenerator {
   private options: WikiOptions;
   private onProgress: ProgressCallback;
   private failedModules: string[] = [];
+  private groupingFallback?: string;
 
   constructor(
     repoPath: string,
@@ -443,6 +446,7 @@ export class WikiGenerator {
         mode: 'full',
         failedModules: [],
         moduleTree,
+        groupingFallback: this.groupingFallback,
       };
       return reviewResult;
     }
@@ -518,7 +522,12 @@ export class WikiGenerator {
     });
 
     this.onProgress('done', 100, 'Wiki generation complete');
-    return { pagesGenerated, mode: 'full', failedModules: [...this.failedModules] };
+    return {
+      pagesGenerated,
+      mode: 'full',
+      failedModules: [...this.failedModules],
+      groupingFallback: this.groupingFallback,
+    };
   }
 
   // ─── Phase 1: Build Module Tree ────────────────────────────────────
@@ -570,19 +579,22 @@ export class WikiGenerator {
       DIRECTORY_TREE: dirTree,
     });
 
-    const promptTokens = estimateTokens(prompt);
     let grouping: Record<string, string[]>;
 
-    if (promptTokens <= GROUPING_TOKEN_BUDGET) {
+    if (this.groupingFits(files)) {
       // Grouping is a structured-data phase (JSON output), not documentation.
       // Do NOT apply buildSystemPrompt here — a language instruction would risk
       // translating module-name keys, breaking slug stability and JSON parsing.
-      const response = await this.invokeLLM(
-        prompt,
-        GROUPING_SYSTEM_PROMPT,
-        this.streamOpts('Grouping files', 15, 13),
-      );
-      grouping = this.parseGroupingResponse(response.content, files);
+      try {
+        const response = await this.invokeLLM(
+          prompt,
+          GROUPING_SYSTEM_PROMPT,
+          this.streamOpts('Grouping files', 15, 13),
+        );
+        grouping = this.parseGroupingResponse(response.content, files);
+      } catch (error) {
+        grouping = this.fallbackGrouping(files, this.groupingErrorReason(error));
+      }
     } else {
       grouping = await this.batchedGrouping(files);
     }
@@ -617,7 +629,7 @@ export class WikiGenerator {
   }
 
   /**
-   * Run grouping in batches when the full file list exceeds GROUPING_TOKEN_BUDGET.
+   * Run grouping in batches when the full request or estimated answer exceeds its budget.
    */
   private async batchedGrouping(files: FileWithExports[]): Promise<Record<string, string[]>> {
     const batches = this.batchFilesForGrouping(files);
@@ -647,13 +659,8 @@ export class WikiGenerator {
           this.streamOpts(`Grouping batch ${i + 1}/${batches.length}`, batchStart, batchRange),
         );
         partials.push(this.parseGroupingResponse(response.content, batch));
-      } catch {
-        this.onProgress(
-          'grouping',
-          15,
-          `Batch ${i + 1} failed, falling back to directory grouping`,
-        );
-        return this.fallbackGrouping(files);
+      } catch (error) {
+        return this.fallbackGrouping(files, this.groupingErrorReason(error));
       }
     }
 
@@ -665,11 +672,13 @@ export class WikiGenerator {
       merged['Other'] = [...(merged['Other'] ?? []), ...unassigned];
     }
 
-    return Object.keys(merged).length > 0 ? merged : this.fallbackGrouping(files);
+    return Object.keys(merged).length > 0
+      ? merged
+      : this.fallbackGrouping(files, 'empty grouping response');
   }
 
   /**
-   * Partition files into batches that fit within GROUPING_TOKEN_BUDGET.
+   * Partition files into batches that fit both grouping budgets.
    * Groups by top-level directory for semantic coherence.
    */
   private batchFilesForGrouping(files: FileWithExports[]): FileWithExports[][] {
@@ -691,9 +700,7 @@ export class WikiGenerator {
     let currentBatch: FileWithExports[] = [];
 
     for (const dirFiles of dirGroups.values()) {
-      const dirPromptSize = this.estimateGroupingPromptTokens(dirFiles);
-
-      if (dirPromptSize > GROUPING_TOKEN_BUDGET) {
+      if (!this.groupingFits(dirFiles)) {
         if (currentBatch.length > 0) {
           batches.push(currentBatch);
           currentBatch = [];
@@ -705,7 +712,7 @@ export class WikiGenerator {
             subBatch.push(dirFiles[i]);
             i++;
             if (
-              this.estimateGroupingPromptTokens(subBatch) > GROUPING_TOKEN_BUDGET &&
+              !this.groupingFits(subBatch) &&
               subBatch.length > 1
             ) {
               subBatch.pop();
@@ -715,7 +722,9 @@ export class WikiGenerator {
           }
           if (
             subBatch.length === 1 &&
-            this.estimateGroupingPromptTokens(subBatch) > GROUPING_TOKEN_BUDGET
+            !this.groupingFits(subBatch) &&
+            this.estimateGroupingOutputTokens(subBatch) <=
+              this.llmConfig.maxTokens / GROUPING_OUTPUT_BUDGET_DIVISOR
           ) {
             subBatch[0] = this.trimSymbolsToFit(subBatch[0]);
           }
@@ -725,7 +734,7 @@ export class WikiGenerator {
       }
 
       const candidateBatch = [...currentBatch, ...dirFiles];
-      if (this.estimateGroupingPromptTokens(candidateBatch) > GROUPING_TOKEN_BUDGET) {
+      if (!this.groupingFits(candidateBatch)) {
         if (currentBatch.length > 0) {
           batches.push(currentBatch);
         }
@@ -752,6 +761,21 @@ export class WikiGenerator {
     return estimateTokens(prompt);
   }
 
+  private estimateGroupingOutputTokens(files: FileWithExports[]): number {
+    return files.reduce(
+      (total, file) => total + estimateTokens(`${JSON.stringify(file.filePath)},`),
+      0,
+    );
+  }
+
+  private groupingFits(files: FileWithExports[]): boolean {
+    return (
+      this.estimateGroupingPromptTokens(files) <= GROUPING_TOKEN_BUDGET &&
+      this.estimateGroupingOutputTokens(files) <=
+        this.llmConfig.maxTokens / GROUPING_OUTPUT_BUDGET_DIVISOR
+    );
+  }
+
   private trimSymbolsToFit(file: FileWithExports): FileWithExports {
     const symbols = file.symbols;
     let lo = 0;
@@ -765,7 +789,7 @@ export class WikiGenerator {
           { name: `... and ${symbols.length - mid} more`, type: 'truncated' },
         ],
       };
-      if (this.estimateGroupingPromptTokens([candidate]) <= GROUPING_TOKEN_BUDGET) {
+      if (this.groupingFits([candidate])) {
         lo = mid;
       } else {
         hi = mid - 1;
@@ -831,11 +855,11 @@ export class WikiGenerator {
       parsed = JSON.parse(jsonStr);
     } catch {
       // Fallback: group by top-level directory
-      return this.fallbackGrouping(files);
+      return this.fallbackGrouping(files, 'invalid grouping JSON');
     }
 
     if (typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return this.fallbackGrouping(files);
+      return this.fallbackGrouping(files, 'invalid grouping structure');
     }
 
     // Validate — ensure all files are assigned
@@ -863,13 +887,25 @@ export class WikiGenerator {
       validGrouping['Other'] = unassigned;
     }
 
-    return Object.keys(validGrouping).length > 0 ? validGrouping : this.fallbackGrouping(files);
+    return Object.keys(validGrouping).length > 0
+      ? validGrouping
+      : this.fallbackGrouping(files, 'empty grouping response');
   }
 
   /**
-   * Fallback grouping by top-level directory when LLM parsing fails.
+   * Fallback grouping by top-level directory when LLM grouping fails.
    */
-  private fallbackGrouping(files: FileWithExports[]): Record<string, string[]> {
+  private groupingErrorReason(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private fallbackGrouping(files: FileWithExports[], reason: string): Record<string, string[]> {
+    this.groupingFallback = reason;
+    this.onProgress(
+      'grouping',
+      15,
+      `Grouping failed (${reason}), falling back to directory grouping`,
+    );
     const groups = new Map<string, string[]>();
     for (const f of files) {
       const parts = f.filePath.replace(/\\/g, '/').split('/');
