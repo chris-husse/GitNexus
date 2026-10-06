@@ -124,6 +124,32 @@ describe('batchFilesForGrouping', () => {
     expect((gen as any).batchFilesForGrouping(files)).toEqual([files]);
   });
 
+  it('trims an input-heavy singleton even when its path exceeds the output budget', async () => {
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+    const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
+      apiKey: '', baseUrl: '', model: 'test', maxTokens: 16,
+      temperature: 0, provider: 'openai',
+    });
+    const filePath = `src/${'x'.repeat(80)}.ts`;
+    const file = {
+      filePath,
+      symbols: Array.from({ length: 10_000 }, (_, i) => ({
+        name: `veryLongExportedSymbolName_${i}_padding`,
+        type: 'function',
+      })),
+    };
+    expect((gen as any).estimateGroupingPromptTokens([file])).toBeGreaterThan(100_000);
+
+    const batches = (gen as any).batchFilesForGrouping([file]);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0][0].filePath).toBe(filePath);
+    expect(batches[0][0].symbols.length).toBeLessThan(file.symbols.length);
+    expect(batches[0][0].symbols.at(-1)?.type).toBe('truncated');
+    expect((gen as any).estimateGroupingPromptTokens(batches[0])).toBeLessThanOrEqual(100_000);
+    expect((gen as any).groupingFits(batches[0])).toBe(false);
+  });
+
   it('splits into multiple batches when files exceed budget', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
 

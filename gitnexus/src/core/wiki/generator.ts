@@ -722,9 +722,7 @@ export class WikiGenerator {
           }
           if (
             subBatch.length === 1 &&
-            !this.groupingFits(subBatch) &&
-            this.estimateGroupingOutputTokens(subBatch) <=
-              this.llmConfig.maxTokens / GROUPING_OUTPUT_BUDGET_DIVISOR
+            this.estimateGroupingPromptTokens(subBatch) > GROUPING_TOKEN_BUDGET
           ) {
             subBatch[0] = this.trimSymbolsToFit(subBatch[0]);
           }
@@ -789,7 +787,7 @@ export class WikiGenerator {
           { name: `... and ${symbols.length - mid} more`, type: 'truncated' },
         ],
       };
-      if (this.groupingFits([candidate])) {
+      if (this.estimateGroupingPromptTokens([candidate]) <= GROUPING_TOKEN_BUDGET) {
         lo = mid;
       } else {
         hi = mid - 1;
