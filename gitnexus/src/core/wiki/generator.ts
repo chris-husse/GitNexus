@@ -711,10 +711,7 @@ export class WikiGenerator {
           while (i < dirFiles.length) {
             subBatch.push(dirFiles[i]);
             i++;
-            if (
-              !this.groupingFits(subBatch) &&
-              subBatch.length > 1
-            ) {
+            if (!this.groupingFits(subBatch) && subBatch.length > 1) {
               subBatch.pop();
               i--;
               break;

@@ -78,8 +78,12 @@ describe('batchFilesForGrouping', () => {
   it('estimates quoted output paths, including JSON escapes, without extra allowance', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
     const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens: 1000,
-      temperature: 0, provider: 'openai',
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'openai',
     });
     const files = [
       { filePath: 'a.ts', symbols: [] },
@@ -93,14 +97,16 @@ describe('batchFilesForGrouping', () => {
 
   it('splits output-heavy files using the configured completion cap and keeps every path', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
-    const files = [
-      ...makeFiles(80, 'src'),
-      { filePath: 'win\\quoted".ts', symbols: [] },
-    ];
-    const makeGenerator = (maxTokens: number) => new WikiGenerator('/repo', tmpDir, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens,
-      temperature: 0, provider: 'openai',
-    });
+    const files = [...makeFiles(80, 'src'), { filePath: 'win\\quoted".ts', symbols: [] }];
+    const makeGenerator = (maxTokens: number) =>
+      new WikiGenerator('/repo', tmpDir, '/lbug', {
+        apiKey: '',
+        baseUrl: '',
+        model: 'test',
+        maxTokens,
+        temperature: 0,
+        provider: 'openai',
+      });
     const tight = makeGenerator(1000); // output budget = 250 tokens
     const roomy = makeGenerator(4000); // output budget = 1000 tokens
     expect((tight as any).estimateGroupingPromptTokens(files)).toBeLessThan(100_000);
@@ -116,8 +122,12 @@ describe('batchFilesForGrouping', () => {
   it('terminates with an indivisible output-heavy path still present', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
     const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens: 16,
-      temperature: 0, provider: 'openai',
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 16,
+      temperature: 0,
+      provider: 'openai',
     });
     const files = [{ filePath: `src/${'x'.repeat(80)}.ts`, symbols: [] }];
     expect((gen as any).groupingFits(files)).toBe(false);
@@ -127,8 +137,12 @@ describe('batchFilesForGrouping', () => {
   it('trims an input-heavy singleton even when its path exceeds the output budget', async () => {
     const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
     const gen = new WikiGenerator('/repo', tmpDir, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens: 16,
-      temperature: 0, provider: 'openai',
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 16,
+      temperature: 0,
+      provider: 'openai',
     });
     const filePath = `src/${'x'.repeat(80)}.ts`;
     const file = {
@@ -489,12 +503,17 @@ describe('buildModuleTree batched grouping', () => {
     const storagePath = path.join(tmpDir, 'output-heavy');
     await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
     const files = Array.from({ length: 80 }, (_, i) => ({
-      filePath: `src/file${i}.ts`, symbols: [],
+      filePath: `src/file${i}.ts`,
+      symbols: [],
     }));
     files.push({ filePath: 'win\\quoted".ts', symbols: [] });
     const gen = new WikiGenerator('/repo', storagePath, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens: 1000,
-      temperature: 0, provider: 'openai',
+      apiKey: '',
+      baseUrl: '',
+      model: 'test',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'openai',
     });
     vi.spyOn(gen as any, 'estimateModuleTokens').mockResolvedValue(0);
     const invoke = vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({ content: '{}' });
@@ -519,7 +538,9 @@ describe('buildModuleTree batched grouping', () => {
       getAllFiles: vi.fn().mockResolvedValue(files.map((f) => f.filePath)),
     }));
     vi.doMock('child_process', () => ({
-      execSync: vi.fn().mockImplementation(() => { throw new Error('not a git repo'); }),
+      execSync: vi.fn().mockImplementation(() => {
+        throw new Error('not a git repo');
+      }),
       execFileSync: vi.fn(),
     }));
     const llmClient = await import('../../src/core/wiki/llm-client.js');
@@ -528,16 +549,29 @@ describe('buildModuleTree batched grouping', () => {
     const storagePath = path.join(tmpDir, 'single-failure');
     await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
     const events: string[] = [];
-    const gen = new WikiGenerator('/repo', storagePath, '/lbug', {
-      apiKey: 'key', baseUrl: 'http://localhost', model: 'test',
-      maxTokens: 1000, temperature: 0, provider: 'openai',
-    }, { reviewOnly: true }, (_phase, _percent, detail) => events.push(detail ?? ''));
+    const gen = new WikiGenerator(
+      '/repo',
+      storagePath,
+      '/lbug',
+      {
+        apiKey: 'key',
+        baseUrl: 'http://localhost',
+        model: 'test',
+        maxTokens: 1000,
+        temperature: 0,
+        provider: 'openai',
+      },
+      { reviewOnly: true },
+      (_phase, _percent, detail) => events.push(detail ?? ''),
+    );
 
     const result = await gen.run();
 
     expect(result.moduleTree?.map((node) => node.name)).toEqual(['alpha', 'beta']);
     expect(result.groupingFallback).toBe('completion exhausted');
-    expect(events).toContain('Grouping failed (completion exhausted), falling back to directory grouping');
+    expect(events).toContain(
+      'Grouping failed (completion exhausted), falling back to directory grouping',
+    );
   });
 
   it('reports malformed grouping output as a visible fallback', async () => {
@@ -545,10 +579,21 @@ describe('buildModuleTree batched grouping', () => {
     const storagePath = path.join(tmpDir, 'malformed');
     await fs.mkdir(path.join(storagePath, 'wiki'), { recursive: true });
     const events: string[] = [];
-    const gen = new WikiGenerator('/repo', storagePath, '/lbug', {
-      apiKey: '', baseUrl: '', model: 'test', maxTokens: 1000,
-      temperature: 0, provider: 'openai',
-    }, {}, (_phase, _percent, detail) => events.push(detail ?? ''));
+    const gen = new WikiGenerator(
+      '/repo',
+      storagePath,
+      '/lbug',
+      {
+        apiKey: '',
+        baseUrl: '',
+        model: 'test',
+        maxTokens: 1000,
+        temperature: 0,
+        provider: 'openai',
+      },
+      {},
+      (_phase, _percent, detail) => events.push(detail ?? ''),
+    );
     vi.spyOn(gen as any, 'estimateModuleTokens').mockResolvedValue(0);
     vi.spyOn(gen as any, 'invokeLLM').mockResolvedValue({ content: '{broken' });
 

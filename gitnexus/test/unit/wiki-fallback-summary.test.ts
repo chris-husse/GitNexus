@@ -21,31 +21,42 @@ describe('wiki fallback summary', () => {
 
   async function run(review: boolean) {
     const firstResult = {
-      mode: 'full', pagesGenerated: 0, failedModules: [],
+      mode: 'full',
+      pagesGenerated: 0,
+      failedModules: [],
       groupingFallback: 'completion exhausted',
       moduleTree: review ? [{ name: 'alpha', slug: 'alpha', files: ['alpha/a.ts'] }] : undefined,
     };
     const nextResult = { mode: 'full', pagesGenerated: 2, failedModules: [] };
     const results = [firstResult, nextResult];
     vi.doMock('../../src/storage/git.js', () => ({
-      getGitRoot: vi.fn(), isGitRepo: vi.fn().mockReturnValue(true),
+      getGitRoot: vi.fn(),
+      isGitRepo: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/storage/storage-resolver.js', async (importActual) => ({
       ...(await importActual<typeof import('../../src/storage/storage-resolver.js')>()),
       requireStoragePath: vi.fn().mockResolvedValue('/tmp/wiki-storage'),
     }));
     vi.doMock('../../src/storage/repo-manager.js', () => ({
-      getStoragePaths: vi.fn().mockReturnValue({ storagePath: '/tmp/wiki-storage', lbugPath: '/tmp/wiki-db' }),
+      getStoragePaths: vi
+        .fn()
+        .mockReturnValue({ storagePath: '/tmp/wiki-storage', lbugPath: '/tmp/wiki-db' }),
       loadCLIConfig: vi.fn().mockResolvedValue({
-        provider: 'openai', apiKey: 'key', baseUrl: 'https://api.openai.com/v1', model: 'test',
+        provider: 'openai',
+        apiKey: 'key',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'test',
       }),
       saveCLIConfig: vi.fn(),
     }));
     vi.doMock('../../src/core/wiki/llm-client.js', async (importActual) => ({
       ...(await importActual<typeof import('../../src/core/wiki/llm-client.js')>()),
       resolveLLMConfig: vi.fn().mockResolvedValue({
-        provider: 'openai', apiKey: 'key', baseUrl: 'https://api.openai.com/v1',
-        model: 'test', maxTokens: 1000,
+        provider: 'openai',
+        apiKey: 'key',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'test',
+        maxTokens: 1000,
       }),
     }));
     vi.doMock('../../src/core/wiki/generator.js', () => ({
