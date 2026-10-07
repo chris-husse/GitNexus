@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { execFileSync } from 'node:child_process';
+import { IncludeExtractor } from '../../src/core/group/extractors/include-extractor.js';
 import {
   walkRepositoryPaths,
   readFileContents,
@@ -780,5 +782,153 @@ describe('filesystem-walker', () => {
         'src/big7.ts',
       ]);
     });
+  });
+});
+
+describe('tracked repository discovery', () => {
+  let root: string;
+  let repo: string;
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync(
+      'git',
+      [
+        '-c',
+        'commit.gpgsign=false',
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.test',
+        ...args,
+      ],
+      { cwd, stdio: 'pipe' },
+    );
+  const write = async (rel: string, content = 'export const value = 1;') => {
+    await fs.mkdir(path.dirname(path.join(repo, rel)), { recursive: true });
+    await fs.writeFile(path.join(repo, rel), content);
+  };
+  const includes = (dir = repo) =>
+    (
+      new IncludeExtractor() as unknown as {
+        discoverIndexableFiles(root: string): Promise<string[]>;
+      }
+    ).discoverIndexableFiles(dir);
+  const paths = async (dir = repo) =>
+    (await walkRepositoryPaths(dir, undefined, { quiet: true })).map((f) => f.path);
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-tracked-walker-'));
+    repo = path.join(root, 'repo');
+    await fs.mkdir(repo);
+    git(repo, 'init', '-q');
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('intersects both discoveries with the index without entering submodules or nested clones', async () => {
+    await write('src/keep.ts');
+    await write('.hidden.ts');
+    await write('.gitignore', 'ignored.ts\n');
+    await write('ignored.ts');
+    await write('crates/vendored/kept.ts');
+    git(repo, 'add', '--', 'src/keep.ts', '.hidden.ts', '.gitignore', 'crates/vendored/kept.ts');
+    git(repo, 'commit', '-qm', 'fixture');
+    await write('src/staged.ts');
+    git(repo, 'add', '--', 'src/staged.ts');
+    await write('scratch.ts');
+    const child = path.join(root, 'child');
+    await fs.mkdir(child);
+    git(child, 'init', '-q');
+    await fs.writeFile(path.join(child, 'child.ts'), 'export const child = 1;');
+    git(child, 'add', '--', 'child.ts');
+    git(child, 'commit', '-qm', 'child');
+    git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', child, 'modules/child');
+    git(repo, 'clone', '--quiet', child, 'nested-clone');
+    const expected = ['crates/vendored/kept.ts', 'src/keep.ts', 'src/staged.ts'];
+    expect(await paths()).toEqual(expected);
+    expect((await includes()).sort()).toEqual(expected);
+    expect(await paths(path.join(repo, 'src'))).toEqual(['keep.ts', 'staged.ts']);
+    expect((await includes(path.join(repo, 'src'))).sort()).toEqual(['keep.ts', 'staged.ts']);
+  });
+
+  it('omits missing tracked files and does not follow a tracked directory symlink', async () => {
+    await write('keep.ts');
+    await write('missing.ts');
+    const target = path.join(root, 'target');
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, 'outside.ts'), 'export const outside = 1;');
+    try {
+      await fs.symlink(target, path.join(repo, 'linked'), 'dir');
+    } catch (error) {
+      throw new Error('This test requires permission to create directory symlinks', {
+        cause: error,
+      });
+    }
+    git(repo, 'add', '--', 'keep.ts', 'missing.ts', 'linked');
+    await fs.unlink(path.join(repo, 'missing.ts'));
+    expect(await paths()).toEqual(['keep.ts', 'linked']);
+    expect((await includes()).sort()).toEqual(['keep.ts', 'linked']);
+  });
+
+  it('passes tracked eligible paths to metadata discovery before the size cap and narrates once', async () => {
+    await write('keep.ts');
+    await write('large.ts', 'x'.repeat(2048));
+    await write('scratch.ts');
+    git(repo, 'add', '--', 'keep.ts', 'large.ts');
+    vi.stubEnv('GITNEXUS_ANALYZE_PROGRESS_ACTIVE', '1');
+    vi.stubEnv('GITNEXUS_MAX_FILE_SIZE', '1');
+    const warnings = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const discovered = vi.fn(async (_paths: readonly string[]) => {});
+    expect(
+      (await walkRepositoryPaths(repo, undefined, { onPathsDiscovered: discovered })).map(
+        (f) => f.path,
+      ),
+    ).toEqual(['keep.ts']);
+    expect(discovered).toHaveBeenCalledTimes(1);
+    expect([...discovered.mock.calls[0][0]].sort()).toEqual(['keep.ts', 'large.ts']);
+    const scope = warnings.mock.calls
+      .map(([msg]) => String(msg))
+      .filter((msg) => msg.includes('Scope:'));
+    expect(scope).toHaveLength(1);
+    expect(scope[0]).toMatch(/2 of 3 walked files.*tracked/);
+    warnings.mockClear();
+    expect(await includes()).toEqual(['keep.ts']);
+    await walkRepositoryPaths(repo, undefined, { quiet: true });
+    expect(warnings).not.toHaveBeenCalled();
+  });
+
+  it('reports zero tracked files for a successful empty index', async () => {
+    await write('scratch.ts');
+    const cap = _captureLogger();
+    try {
+      expect(await walkRepositoryPaths(repo)).toEqual([]);
+      expect(await includes()).toEqual([]);
+      const messages = cap.records().map((r) => String(r.msg ?? ''));
+      expect(messages.filter((m) => m.includes('Scope:'))).toHaveLength(1);
+      expect(messages.some((m) => m.includes('0 tracked files'))).toBe(true);
+      expect(messages.some((m) => m.includes('unavailable'))).toBe(false);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('keeps filesystem discovery with an accurate, single fallback reason outside git', async () => {
+    await fs.rm(path.join(repo, '.git'), { recursive: true });
+    await write('scratch.ts');
+    const cap = _captureLogger();
+    try {
+      expect((await walkRepositoryPaths(repo)).map((f) => f.path)).toEqual(['scratch.ts']);
+      expect(await includes()).toEqual(['scratch.ts']);
+      const scope = cap
+        .records()
+        .map((r) => String(r.msg ?? ''))
+        .filter((m) => m.includes('Scope:'));
+      expect(scope).toHaveLength(1);
+      expect(scope[0]).toContain('git ls-files unavailable');
+    } finally {
+      cap.restore();
+    }
   });
 });
