@@ -78,6 +78,47 @@ afterEach(() => {
 });
 
 describe('detectIndexContentDrift', () => {
+  it('ignores new untracked files while preserving recorded-path recovery', async () => {
+    const repo = makeRepo({ 'a.js': 'export const a = 1;\n' });
+    execFileSync(gitExecutable, ['init', '-q'], { cwd: repo });
+    execFileSync(gitExecutable, ['add', '--', 'a.js'], { cwd: repo });
+    execFileSync(
+      gitExecutable,
+      [
+        '-c',
+        'commit.gpgsign=false',
+        '-c',
+        'user.email=t@t.test',
+        '-c',
+        'user.name=t',
+        'commit',
+        '-qm',
+        'fixture',
+      ],
+      { cwd: repo },
+    );
+    const recorded = await recordCoverage(repo);
+    fs.writeFileSync(path.join(repo, 'scratch.js'), 'export const scratch = 1;\n');
+    expect(await detectIndexContentDrift(repo, recorded)).toEqual({
+      kind: 'current',
+      coveredFileCount: 1,
+    });
+    expect(Object.keys(await recordCoverage(repo))).toEqual(['a.js']);
+    // A legacy index may have covered this now-untracked file. It remains
+    // recoverable for drift checking until analyze replaces that coverage.
+    const legacy = {
+      ...recorded,
+      ...Object.fromEntries(await computeFileHashes(repo, ['scratch.js'])),
+    };
+    fs.writeFileSync(path.join(repo, 'scratch.js'), 'export const scratch = 2;\n');
+    expect(await detectIndexContentDrift(repo, legacy)).toMatchObject({
+      kind: 'drifted',
+      changed: ['scratch.js'],
+      added: [],
+      deleted: [],
+    });
+  });
+
   it('reports current when every covered file still matches disk', async () => {
     const repo = makeRepo({ 'a.js': 'export const a = 1;\n' });
     const recorded = await recordCoverage(repo);
