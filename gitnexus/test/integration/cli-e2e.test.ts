@@ -1101,6 +1101,17 @@ describe('CLI end-to-end', () => {
             setTimeout(action, 200);
           };
 
+          // Discovery is scoped to Git-tracked files, so a brand-new fixture
+          // file must be staged before the watcher's refresh can see it.
+          const stageNewFile = (fileName: string) => {
+            const added = spawnSync('git', ['add', '--', fileName], { cwd: repo, stdio: 'pipe' });
+            if (added.status === 0 || settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.kill('SIGTERM');
+            reject(new Error(`git add ${fileName} failed: ${added.stderr?.toString() ?? ''}`));
+          };
+
           const writeLargeSource = (fileName: string, functionName: string) => {
             fs.writeFileSync(
               path.join(repo, fileName),
@@ -1108,6 +1119,7 @@ describe('CLI end-to-end', () => {
                 `export function ${functionName}(): number { return padding.length; }\n`,
               'utf8',
             );
+            stageNewFile(fileName);
           };
 
           const handleOutput = () => {
@@ -1123,6 +1135,7 @@ describe('CLI end-to-end', () => {
                   'export function watchProof(): number { return 1; }\n',
                   'utf8',
                 );
+                stageNewFile('watch-proof.ts');
               });
               return;
             }
