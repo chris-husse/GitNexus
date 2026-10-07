@@ -70,6 +70,26 @@ const gitPathListExec = {
   maxBuffer: GIT_PATH_LIST_MAX_BUFFER,
 };
 
+/** Git-indexed, repo-relative file paths below `repoPath`; null if Git cannot list them. */
+export const listTrackedFiles = (repoPath: string): Set<string> | null => {
+  try {
+    const out = execFileSync('git', ['ls-files', '--stage', '-z', '--'], {
+      cwd: repoPath,
+      windowsHide: true,
+      ...gitPathListExec,
+    });
+    const paths = new Set<string>();
+    for (const record of out.split('\0')) {
+      const tab = record.indexOf('\t');
+      if (tab === -1 || record.startsWith('160000 ')) continue;
+      paths.add(record.slice(tab + 1));
+    }
+    return paths;
+  } catch {
+    return null;
+  }
+};
+
 const listHiddenIndexPaths = (repoPath: string): string[] => {
   const out = execFileSync('git', ['ls-files', '-v', '-z', '--'], {
     cwd: repoPath,
