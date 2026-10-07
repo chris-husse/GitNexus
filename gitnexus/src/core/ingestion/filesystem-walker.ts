@@ -5,6 +5,7 @@ import { readdir } from 'node:fs';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
+import { listTrackedFiles } from '../../storage/git.js';
 import { mapConcurrent } from '../../lib/utils.js';
 
 import { logger } from '../logger.js';
@@ -62,7 +63,7 @@ export interface WalkRepositoryOptions {
   /** Capture required metadata before stat/size filtering can omit its inputs. */
   onPathsDiscovered?: (paths: readonly string[]) => Promise<void>;
   /**
-   * Suppress the operator-facing large-file notice. Set by read-only callers
+   * Suppress the operator-facing scope and large-file notices. Set by read-only callers
    * such as `status`, which reuse this scan purely to learn which files the
    * index covers and must not emit analyze's progress commentary.
    */
@@ -105,7 +106,7 @@ export const walkRepositoryPaths = async (
   const maxFileSizeBytes = options.maxFileSizeBytes ?? getMaxFileSizeBytes();
   let enumerationError: NodeJS.ErrnoException | undefined;
 
-  const filtered = (
+  const walked = (
     await glob('**/*', {
       cwd: repoPath,
       nodir: true,
@@ -127,6 +128,15 @@ export const walkRepositoryPaths = async (
     })
   ).map((filePath) => filePath.replace(/\\/g, '/'));
   if (enumerationError !== undefined) throw enumerationError;
+  const tracked = listTrackedFiles(repoPath);
+  const filtered = tracked === null ? walked : walked.filter((filePath) => tracked.has(filePath));
+  if (!options.quiet) {
+    warnLargeFileSkip(
+      tracked === null
+        ? '  Scope: filesystem walk (git ls-files unavailable); all walked files kept'
+        : `  Scope: ${filtered.length} of ${walked.length} walked files are tracked (git ls-files); ${filtered.length === 0 ? '0 tracked files' : 'the rest were skipped'}`,
+    );
+  }
   await options.onPathsDiscovered?.(filtered);
   const entries: ScannedFile[] = [];
   let processed = 0;

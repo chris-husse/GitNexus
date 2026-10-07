@@ -22,6 +22,7 @@ import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
 import { buildSuffixIndex, type SuffixIndex } from '../../ingestion/import-resolvers/utils.js';
+import { listTrackedFiles } from '../../../storage/git.js';
 import { createIgnoreFilter } from '../../../config/ignore-service.js';
 import { getMaxFileSizeBytes } from '../../ingestion/utils/max-file-size.js';
 import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
@@ -364,6 +365,7 @@ export class IncludeExtractor implements ContractExtractor {
    *   - `createIgnoreFilter` honors `.gitignore`, `.gitnexusignore`, the
    *     hardcoded ignore list, and `.gitnexusignore` last-match-wins
    *     negation.
+   *   - Intersect glob results with `listTrackedFiles` when Git is available.
    *   - `getMaxFileSizeBytes()` drops files larger than the cap so we
    *     never emit `File:<rel>` UIDs for files ingestion would skip.
    *
@@ -372,8 +374,8 @@ export class IncludeExtractor implements ContractExtractor {
    * and parallelism gains are not worth the import-graph weight.
    *
    * MAINTENANCE: if `walkRepositoryPaths` changes its glob options, ignore
-   * filter shape, or size-cap logic, mirror those changes here. The two
-   * implementations exist because the consumers need different return
+   * filter shape, tracked-file intersection, or size-cap logic, mirror those
+   * changes here. The two implementations exist because the consumers need different return
    * shapes (string[] vs ScannedFile[]) and different concurrency, but
    * they MUST agree on which files are reachable — that is what makes
    * `File:<rel>` UIDs in cross-links correspond to graph File nodes.
@@ -382,15 +384,21 @@ export class IncludeExtractor implements ContractExtractor {
     const ignoreFilter = await createIgnoreFilter(repoPath);
     const maxFileSizeBytes = getMaxFileSizeBytes();
 
-    const candidates = await glob('**/*', {
-      cwd: repoPath,
-      nodir: true,
-      dot: false,
-      ignore: ignoreFilter,
-    });
+    // glob reports platform separators while `git ls-files` emits POSIX
+    // paths, so normalize before the tracked intersection (as the walker does).
+    const candidates = (
+      await glob('**/*', {
+        cwd: repoPath,
+        nodir: true,
+        dot: false,
+        ignore: ignoreFilter,
+      })
+    ).map((rel) => rel.replace(/\\/g, '/'));
 
+    const tracked = listTrackedFiles(repoPath);
+    const filtered = tracked === null ? candidates : candidates.filter((rel) => tracked.has(rel));
     const survivors: string[] = [];
-    for (const rel of candidates) {
+    for (const rel of filtered) {
       try {
         const stat = await fs.stat(path.join(repoPath, rel));
         if (stat.size > maxFileSizeBytes) continue;
