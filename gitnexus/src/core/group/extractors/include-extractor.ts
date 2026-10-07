@@ -384,12 +384,16 @@ export class IncludeExtractor implements ContractExtractor {
     const ignoreFilter = await createIgnoreFilter(repoPath);
     const maxFileSizeBytes = getMaxFileSizeBytes();
 
-    const candidates = await glob('**/*', {
-      cwd: repoPath,
-      nodir: true,
-      dot: false,
-      ignore: ignoreFilter,
-    });
+    // glob reports platform separators while `git ls-files` emits POSIX
+    // paths, so normalize before the tracked intersection (as the walker does).
+    const candidates = (
+      await glob('**/*', {
+        cwd: repoPath,
+        nodir: true,
+        dot: false,
+        ignore: ignoreFilter,
+      })
+    ).map((rel) => rel.replace(/\\/g, '/'));
 
     const tracked = listTrackedFiles(repoPath);
     const filtered = tracked === null ? candidates : candidates.filter((rel) => tracked.has(rel));

@@ -117,6 +117,8 @@ describe('shared store seeding (#3352)', () => {
     const wtA = addWorktree('wt-a');
     await analyze(wtA);
     await fs.writeFile(path.join(wtA, 'c.ts'), 'export function gamma() { return 3; }\n');
+    // Discovery is scoped to tracked files: a new file is indexed once staged.
+    git(wtA, 'add', '--', 'c.ts');
     await analyze(wtA);
     const slot = layoutOf(wtA).checkoutSlot;
     expect(existsSync(path.join(slot, 'lbug'))).toBe(true);
@@ -211,6 +213,8 @@ describe('shared store seeding (#3352)', () => {
     await analyze(main);
     await fs.writeFile(path.join(wt, 'b.ts'), 'export function betaTwo() { return 22; }\n');
     await fs.writeFile(path.join(wt, 'c.ts'), 'export function gamma() { return 3; }\n');
+    // Discovery is scoped to tracked files: a new file is indexed once staged.
+    git(wt, 'add', '--', 'c.ts');
     await analyze(wt);
     const seeded = await queryNames(graphOf(wt));
 
