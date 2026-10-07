@@ -194,6 +194,8 @@ export async function loadDartPackageConfig(
   let captured: DartPackageConfig | undefined;
   try {
     await walkRepositoryPaths(repoPath, undefined, {
+      // The scan phase owns the scope/large-file narration; discovery must not repeat it.
+      quiet: true,
       onPathsDiscovered: async (paths) => {
         captured = await captureDartPackageConfig(repoPath, paths, options);
       },
