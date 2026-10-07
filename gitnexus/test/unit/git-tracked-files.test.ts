@@ -25,7 +25,17 @@ describe('listTrackedFiles', () => {
       git(root, 'init', '-q');
       fs.writeFileSync(path.join(root, 'committed.ts'), 'committed');
       git(root, 'add', '--', 'committed.ts');
-      git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-q', '-m', 'fixture');
+      git(
+        root,
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.invalid',
+        'commit',
+        '-q',
+        '-m',
+        'fixture',
+      );
 
       for (const name of ['staged.ts', 'tab\tname.ts', 'line\nname.ts', 'é.ts']) {
         fs.writeFileSync(path.join(root, name), name);

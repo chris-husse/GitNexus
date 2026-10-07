@@ -18,6 +18,8 @@ import * as git from '../../src/storage/git.js';
 vi.mock('../../src/storage/git.js', () => ({
   getCoreExcludesFilePath: vi.fn(),
   getGitInfoExcludePath: vi.fn(),
+  // Fixtures are plain mkdtemp dirs, not git repos: the real helper returns null (filesystem fallback).
+  listTrackedFiles: vi.fn(() => null),
 }));
 
 // Every other describe block in this file calls loadIgnoreRules/
