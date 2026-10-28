@@ -391,13 +391,14 @@ describe('DEFAULT_BACKEND_URL resolution', () => {
   it('does not resolve a protocol-relative backendUrl as a path', async () => {
     window.__GITNEXUS_CONFIG__ = { backendUrl: '//evil.example' };
     const { DEFAULT_BACKEND_URL } = await import('../../src/config/ui-constants');
-    expect(DEFAULT_BACKEND_URL).toBe('//evil.example');
+    // R8: neither parses as an absolute http(s) URL, so both fall back to localhost.
+    expect(DEFAULT_BACKEND_URL).toBe('http://localhost:4747');
   });
 
   it('does not resolve a backslash-prefixed backendUrl, which the URL parser reads as a host', async () => {
     window.__GITNEXUS_CONFIG__ = { backendUrl: '/\\evil.example' };
     const { DEFAULT_BACKEND_URL } = await import('../../src/config/ui-constants');
-    expect(DEFAULT_BACKEND_URL).toBe('/\\evil.example');
+    expect(DEFAULT_BACKEND_URL).toBe('http://localhost:4747');
   });
 
   it('keeps a configured prefix ending in /api through health, discovery and repository selection', async () => {

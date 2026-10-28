@@ -21,7 +21,7 @@ describe('fetchMetadataByLabel — Cypher label allowlist (R3)', () => {
       [evilLabel, [{ nodeId: `${evilLabel}:src/x.ts:foo`, ...chunk }]],
     ]);
 
-    const executeQuery = vi.fn(async () => []);
+    const executeQuery = vi.fn(async (_cypher: string): Promise<any[]> => []);
     const results = await fetchMetadataByLabel(executeQuery, byLabel);
 
     // The unvalidated label must never be interpolated into a query.
@@ -39,7 +39,7 @@ describe('fetchMetadataByLabel — Cypher label allowlist (R3)', () => {
       ['Function', [{ nodeId, ...chunk }]],
     ]);
 
-    const executeQuery = vi.fn(async () => [
+    const executeQuery = vi.fn(async (_cypher: string) => [
       { id: nodeId, name: 'add', filePath: 'src/calc.ts', startLine: 1, endLine: 2 },
     ]);
 
@@ -63,10 +63,12 @@ describe('fetchMetadataByLabel — Cypher label allowlist (R3)', () => {
       ['Function', [{ nodeId, ...chunk }]],
     ]);
 
-    const executeParameterized = vi.fn(async () => [
-      { id: nodeId, name: 'weird', filePath: 'src/x.ts', startLine: 1, endLine: 2 },
-    ]);
-    const executeQuery = vi.fn(async () => []);
+    const executeParameterized = vi.fn(
+      async (_cypher: string, _params: Record<string, unknown>) => [
+        { id: nodeId, name: 'weird', filePath: 'src/x.ts', startLine: 1, endLine: 2 },
+      ],
+    );
+    const executeQuery = vi.fn(async (_cypher: string): Promise<any[]> => []);
 
     const results = await fetchMetadataByLabel(executeQuery, byLabel, executeParameterized);
 

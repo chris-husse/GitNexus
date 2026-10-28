@@ -36,6 +36,8 @@ const builtins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]
 const infrastructure: Record<string, string> = {
   'config/ignore-service.ts:storage/git.ts':
     'Ignore-file discovery changes the enumerated source inputs, already included in chunk keys.',
+  'core/ingestion/filesystem-walker.ts:storage/git.ts':
+    'Tracked-file scoping changes the enumerated source inputs, already included in chunk keys.',
   'core/analyzer-identity.ts:storage/repo-manager.ts':
     'Type-only analyzer receipt contract; parser identity uses independent frames.',
   'core/ingestion/finalize-orchestrator.ts:storage/scope-index-store.ts':

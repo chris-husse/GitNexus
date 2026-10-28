@@ -176,7 +176,8 @@ describe('semantic rename reports exact applied occurrences (#3486, #2605)', () 
     expect(
       result.changes.find((change: any) => change.file_path === 'src/writer.ts').edits,
     ).toHaveLength(3);
-    expect(execFileSyncMock).not.toHaveBeenCalled();
+    // Tracked-file scoping may ask `git ls-files`; text discovery (rg) must not run.
+    expect(execFileSyncMock.mock.calls.filter((call: unknown[]) => call[0] !== 'git')).toEqual([]);
     expect(await fs.readFile(path.join(tmpDir, 'src/writer.ts'), 'utf8')).toBe(SOURCE);
   });
 

@@ -91,7 +91,7 @@ withTestLbugDB(
           body: JSON.stringify({ cypher: 'RETURN $n AS n', params: { n: 7 } }),
         });
         expect(response.status).toBe(200);
-        const body = await response.json();
+        const body = (await response.json()) as { result: Array<Record<string, unknown>> };
         expect(body.result[0].n).toBe(7);
       });
 
@@ -105,7 +105,7 @@ withTestLbugDB(
           }),
         });
         expect(response.status).toBe(200);
-        const body = await response.json();
+        const body = (await response.json()) as { result: Array<Record<string, unknown>> };
         // The array-of-scalars param binds and UNWINDs to one row per element,
         // proving array params round-trip web → server → executePrepared (the
         // pattern the web tools' `WHERE x IN $ids` lists rely on).
@@ -122,7 +122,7 @@ withTestLbugDB(
           }),
         });
         expect(response.status).toBe(400);
-        const body = await response.json();
+        const body = (await response.json()) as { error: string };
         expect(body.error).toContain('"params"');
       });
 
@@ -136,7 +136,7 @@ withTestLbugDB(
           }),
         });
         expect(response.status).toBe(400);
-        const body = await response.json();
+        const body = (await response.json()) as { error: string };
         expect(body.error).toContain('"params"');
       });
 

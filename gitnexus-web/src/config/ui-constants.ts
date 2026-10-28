@@ -28,7 +28,6 @@ export function resolveDefaultBackendUrl(
   return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? configUrl : fallback;
 }
 
-
 /**
  * A root-relative injected backend (`/`, or `/prefix`) resolved against the
  * page's own origin, so the API is reached on whichever hostname served the UI
